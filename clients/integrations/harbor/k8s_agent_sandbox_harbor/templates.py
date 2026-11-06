@@ -79,13 +79,19 @@ def cpu_quantity(cpus: int | float) -> str:
 
 
 def dns_public_egress() -> list[dict[str, Any]]:
-    """Egress to cluster DNS and to public addresses only."""
+    """Egress to cluster DNS and to public addresses only.
+
+    With NodeLocal DNSCache (a GKE add-on, also common elsewhere), a pod's
+    queries to the kube-dns Service go to the ``node-local-dns`` pod on its
+    node, which has a private pod IP and its own label. Without that peer
+    every lookup times out.
+    """
+    kube_system = {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}}
     return [
         {
-            "to": [{
-                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
-                "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
-            }],
+            "to": [{"namespaceSelector": kube_system,
+                    "podSelector": {"matchLabels": {"k8s-app": app}}}
+                   for app in ("kube-dns", "node-local-dns")],
             "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
         },
         {
@@ -194,11 +200,10 @@ def template_name_for(options: EnvironmentOptions, image: str, resources: Resour
                       workdir: str | None, *, internet: bool) -> str:
     """Name from everything that shapes the pair, so equal inputs share one
     template and pool, and a changed input (a new image, other resources, a
-    different replica count, labels or network) gets a new pair instead of a
-    silent reuse."""
+    different replica count, labels or network policy) gets a new pair instead
+    of a silent reuse."""
     pod = render_pod_spec(image, resources, options, workdir)
-    # "none" leaves the names of templates with internet unchanged.
-    network = options.network if internet else "none"
+    network = template_network_policy(options, internet)
     key = json.dumps({"pod": pod, "network": network,
                       "replicas": options.warm_replicas, "labels": common_labels(options)},
                      sort_keys=True)

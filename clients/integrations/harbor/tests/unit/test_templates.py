@@ -51,6 +51,11 @@ def test_render_template_pod_spec_and_network():
     assert pod["tolerations"] == [{"key": "sandbox", "operator": "Exists"}]
     egress = t["spec"]["networkPolicy"]["egress"]
     assert t["spec"]["networkPolicy"]["ingress"] == []
+    # DNS reaches kube-dns directly, or the per-node cache when NodeLocal DNSCache is on.
+    assert [(p["namespaceSelector"]["matchLabels"], p["podSelector"]["matchLabels"])
+            for p in egress[0]["to"]] == [
+        ({"kubernetes.io/metadata.name": "kube-system"}, {"k8s-app": "kube-dns"}),
+        ({"kubernetes.io/metadata.name": "kube-system"}, {"k8s-app": "node-local-dns"})]
     assert egress[0]["ports"] == [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
     assert "10.0.0.0/8" in egress[1]["to"][0]["ipBlock"]["except"]
     assert "100.64.0.0/10" in egress[1]["to"][0]["ipBlock"]["except"]
@@ -77,6 +82,15 @@ def test_template_name_tracks_the_rendered_spec():
     assert a != template_name_for(EnvironmentOptions(warm_replicas=2), "img:1", RES, "/app", internet=True)
     assert a != template_name_for(EnvironmentOptions(extra_labels={"team": "x"}), "img:1", RES, "/app", internet=True)
     assert a != template_name_for(opts, "img:1", RES, "/app", internet=False)
+
+
+def test_a_changed_egress_rule_gets_a_new_template_name(monkeypatch):
+    # A template that already exists is reused as is, so a release that changes
+    # the rule must not land on the old name and keep the old policy.
+    import k8s_agent_sandbox_harbor.templates as templates
+    before = template_name_for(EnvironmentOptions(), "img:1", RES, "/app", internet=True)
+    monkeypatch.setattr(templates, "dns_public_egress", lambda: [{"to": [{"ipBlock": {"cidr": "1.2.3.4/32"}}]}])
+    assert template_name_for(EnvironmentOptions(), "img:1", RES, "/app", internet=True) != before
 
 
 @pytest.mark.parametrize("network", ["dns-public", "managed-default"])
