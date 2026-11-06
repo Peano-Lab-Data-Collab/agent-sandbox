@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 from harbor.environments.base import BaseEnvironment
-from harbor.models.task.config import EnvironmentConfig
+from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.config import ResourceMode
 
 from k8s_agent_sandbox_harbor import AgentSandboxEnvironment, ImageUnavailableError
@@ -176,6 +176,21 @@ async def test_two_trials_of_one_task_share_the_template(task_dir, trial_paths, 
     custom = fake_clients["custom"]
     assert len([c for c in custom.calls if c[0] == "create"]) == 2       # template + pool, once
     assert a.claim_name != b.claim_name and a._pool == b._pool
+
+
+async def test_a_task_without_internet_gets_a_template_that_blocks_all_traffic(
+        task_dir, trial_paths, env_config, fake_clients):
+    open_env = make_env(task_dir, trial_paths, env_config)
+    closed_env = make_env(task_dir, trial_paths, env_config,
+                          network_policy=NetworkPolicy(network_mode=NetworkMode.NO_NETWORK))
+    closed_env.validate_network_policy_support()
+    await open_env.start(force_build=False)
+    await closed_env.start(force_build=False)
+    assert closed_env._pool != open_env._pool
+    custom = fake_clients["custom"]
+    closed = custom.objects[(TEMPLATES, closed_env._pool)]["spec"]["networkPolicy"]
+    opened = custom.objects[(TEMPLATES, open_env._pool)]["spec"]["networkPolicy"]
+    assert closed == {"ingress": [], "egress": []} and opened["egress"]
 
 
 async def test_write_timings_lands_in_the_sandbox(task_dir, trial_paths, env_config, fake_clients):

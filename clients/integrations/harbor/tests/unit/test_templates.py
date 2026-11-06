@@ -37,7 +37,7 @@ def test_render_template_pod_spec_and_network():
                               image_pull_secret="ps", extra_labels={"team": "rl"},
                               tolerations=[{"key": "sandbox", "operator": "Exists"}])
     t = render_template(name="hb-abc", namespace="harbor", image="alexgshaw/x:1", resources=RES,
-                        options=opts, workdir="/app", environment_name="x", environment_id="e1")
+                        options=opts, workdir="/app", internet=True, environment_name="x", environment_id="e1")
     pod = t["spec"]["podTemplate"]["spec"]
     c = pod["containers"][0]
     assert t["kind"] == "SandboxTemplate" and t["metadata"]["labels"][LABEL_MANAGED_BY] == MANAGED_BY_VALUE
@@ -60,7 +60,7 @@ def test_render_template_pod_spec_and_network():
 def test_managed_default_network_and_no_root_leave_fields_out():
     opts = EnvironmentOptions(network="managed-default", run_as_root=False)
     t = render_template(name="n", namespace="ns", image="i", resources=ResourceSpec(), options=opts,
-                        workdir=None, environment_name="x", environment_id="e")
+                        workdir=None, internet=True, environment_name="x", environment_id="e")
     pod = t["spec"]["podTemplate"]["spec"]
     assert "networkPolicy" not in t["spec"] and "securityContext" not in pod
     assert "resources" not in pod["containers"][0] and "workingDir" not in pod["containers"][0]
@@ -68,14 +68,23 @@ def test_managed_default_network_and_no_root_leave_fields_out():
 
 def test_template_name_tracks_the_rendered_spec():
     opts = EnvironmentOptions()
-    a = template_name_for(opts, "img:1", RES, "/app")
-    assert a == template_name_for(opts, "img:1", RES, "/app") and a.startswith("hb-")
-    assert a != template_name_for(opts, "img:2", RES, "/app")
-    assert a != template_name_for(opts, "img:1", ResourceSpec(cpu_request="2"), "/app")
-    assert a != template_name_for(EnvironmentOptions(runtime_class="gvisor"), "img:1", RES, "/app")
+    a = template_name_for(opts, "img:1", RES, "/app", internet=True)
+    assert a == template_name_for(opts, "img:1", RES, "/app", internet=True) and a.startswith("hb-")
+    assert a != template_name_for(opts, "img:2", RES, "/app", internet=True)
+    assert a != template_name_for(opts, "img:1", ResourceSpec(cpu_request="2"), "/app", internet=True)
+    assert a != template_name_for(EnvironmentOptions(runtime_class="gvisor"), "img:1", RES, "/app", internet=True)
     # A different replica count or label set is a different pair, not a silent reuse.
-    assert a != template_name_for(EnvironmentOptions(warm_replicas=2), "img:1", RES, "/app")
-    assert a != template_name_for(EnvironmentOptions(extra_labels={"team": "x"}), "img:1", RES, "/app")
+    assert a != template_name_for(EnvironmentOptions(warm_replicas=2), "img:1", RES, "/app", internet=True)
+    assert a != template_name_for(EnvironmentOptions(extra_labels={"team": "x"}), "img:1", RES, "/app", internet=True)
+    assert a != template_name_for(opts, "img:1", RES, "/app", internet=False)
+
+
+@pytest.mark.parametrize("network", ["dns-public", "managed-default"])
+def test_template_without_internet_blocks_all_traffic(network):
+    t = render_template(name="n", namespace="ns", image="i", resources=RES,
+                        options=EnvironmentOptions(network=network), workdir=None, internet=False,
+                        environment_name="x", environment_id="e")
+    assert t["spec"]["networkPolicy"] == {"ingress": [], "egress": []}
 
 
 def test_render_pool():
@@ -87,16 +96,16 @@ async def test_store_creates_once_tolerates_409_and_cleans_up():
     api = FakeCustomObjects()
     opts = EnvironmentOptions(namespace="ns", warm_replicas=1)
     store = TemplateStore(api, "ns", opts)
-    name = await store.ensure(image="img:1", resources=RES, workdir=None, environment_name="t",
+    name = await store.ensure(image="img:1", resources=RES, workdir=None, internet=True, environment_name="t",
                               environment_id="e")
-    assert await store.ensure(image="img:1", resources=RES, workdir=None, environment_name="t",
+    assert await store.ensure(image="img:1", resources=RES, workdir=None, internet=True, environment_name="t",
                               environment_id="e") == name
     assert [c for c in api.calls if c[0] == "create"] == [("create", TEMPLATES, name), ("create", POOLS, name)]
     assert api.objects[(POOLS, name)]["spec"]["replicas"] == 1
 
     # Another process created the pair first: 409 on both is success.
     other = TemplateStore(api, "ns", opts)
-    assert await other.ensure(image="img:1", resources=RES, workdir=None, environment_name="t",
+    assert await other.ensure(image="img:1", resources=RES, workdir=None, internet=True, environment_name="t",
                               environment_id="e") == name
 
     api.objects[(CLAIMS, "c1")] = {"metadata": {"name": "c1", "labels": {LABEL_MANAGED_BY: MANAGED_BY_VALUE}}}
@@ -114,4 +123,4 @@ async def test_store_raises_on_other_api_errors():
 
     with pytest.raises(Exception, match="403"):
         await TemplateStore(Broken(), "ns", EnvironmentOptions()).ensure(
-            image="img", resources=RES, workdir=None, environment_name="t", environment_id="e")
+            image="img", resources=RES, workdir=None, internet=True, environment_name="t", environment_id="e")

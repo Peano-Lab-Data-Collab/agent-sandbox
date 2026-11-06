@@ -53,6 +53,9 @@ requests, limits derived from them, and a NetworkPolicy that allows cluster DNS
 and the public internet only. The controller's default policy blocks DNS, and
 Harbor verifiers install packages with `apt` and `uv`, so the template carries its
 own egress rule (`--ek network=managed-default` keeps the controller default).
+A task environment without internet (`network_mode = "no-network"`, or the older
+`allow_internet = false`) gets a policy that blocks all traffic instead, whatever
+`network` says.
 
 ## Options (`--ek key=value`)
 

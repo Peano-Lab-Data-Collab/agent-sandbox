@@ -97,6 +97,24 @@ def dns_public_egress() -> list[dict[str, Any]]:
     ]
 
 
+def template_network_policy(options: EnvironmentOptions, internet: bool) -> dict[str, Any] | None:
+    """The template's ``networkPolicy``; ``None`` keeps the controller default.
+
+    The controller blocks all traffic in a direction whose rule list is empty,
+    so a task without internet gets no egress at all, not even cluster DNS.
+    No rule allows ingress, because the pod exec API reaches the pod through
+    the kubelet.
+    """
+    if not internet:
+        return {"ingress": [], "egress": []}
+    if options.network == "dns-public":
+        # The controller's default policy blocks every private range, cluster
+        # DNS included, so a task could not resolve a hostname. Harbor tasks
+        # install packages and fetch test tooling, thus DNS and public egress.
+        return {"ingress": [], "egress": dns_public_egress()}
+    return None
+
+
 def render_pod_spec(image: str, resources: ResourceSpec, options: EnvironmentOptions,
                     workdir: str | None) -> dict[str, Any]:
     container: dict[str, Any] = {
@@ -135,7 +153,7 @@ def common_labels(options: EnvironmentOptions) -> dict[str, str]:
 
 
 def render_template(*, name: str, namespace: str, image: str, resources: ResourceSpec,
-                    options: EnvironmentOptions, workdir: str | None,
+                    options: EnvironmentOptions, workdir: str | None, internet: bool,
                     environment_name: str, environment_id: str) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "podTemplate": {
@@ -143,12 +161,9 @@ def render_template(*, name: str, namespace: str, image: str, resources: Resourc
             "spec": render_pod_spec(image, resources, options, workdir),
         },
     }
-    if options.network == "dns-public":
-        # The controller's default policy blocks every private range, cluster
-        # DNS included, so a task could not resolve a hostname. Harbor tasks
-        # install packages and fetch test tooling, thus DNS and public egress.
-        # No ingress: the pod exec API reaches the pod through the kubelet.
-        spec["networkPolicy"] = {"ingress": [], "egress": dns_public_egress()}
+    network_policy = template_network_policy(options, internet)
+    if network_policy is not None:
+        spec["networkPolicy"] = network_policy
     labels = {
         **common_labels(options),
         LABEL_ENVIRONMENT: label_value(environment_name),
@@ -176,12 +191,15 @@ def render_pool(*, name: str, namespace: str, template_name: str, replicas: int,
 
 
 def template_name_for(options: EnvironmentOptions, image: str, resources: ResourceSpec,
-                      workdir: str | None) -> str:
+                      workdir: str | None, *, internet: bool) -> str:
     """Name from everything that shapes the pair, so equal inputs share one
     template and pool, and a changed input (a new image, other resources, a
-    different replica count or labels) gets a new pair instead of a silent reuse."""
+    different replica count, labels or network) gets a new pair instead of a
+    silent reuse."""
     pod = render_pod_spec(image, resources, options, workdir)
-    key = json.dumps({"pod": pod, "network": options.network,
+    # "none" leaves the names of templates with internet unchanged.
+    network = options.network if internet else "none"
+    key = json.dumps({"pod": pod, "network": network,
                       "replicas": options.warm_replicas, "labels": common_labels(options)},
                      sort_keys=True)
     return object_name(options.template_prefix, key)
@@ -225,9 +243,9 @@ class TemplateStore:
             raise
 
     async def ensure(self, *, image: str, resources: ResourceSpec, workdir: str | None,
-                     environment_name: str, environment_id: str) -> str:
+                     internet: bool, environment_name: str, environment_id: str) -> str:
         """Return the pool name for ``image``, creating template and pool if needed."""
-        name = template_name_for(self._options, image, resources, workdir)
+        name = template_name_for(self._options, image, resources, workdir, internet=internet)
         if name in self._ready:
             return name
         async with self._lock(name):
@@ -235,7 +253,8 @@ class TemplateStore:
                 return name
             template = render_template(
                 name=name, namespace=self._namespace, image=image, resources=resources,
-                options=self._options, workdir=workdir, environment_name=environment_name,
+                options=self._options, workdir=workdir, internet=internet,
+                environment_name=environment_name,
                 environment_id=environment_id)
             created = await self._create(TEMPLATES, template)
             pool = render_pool(name=name, namespace=self._namespace, template_name=name,

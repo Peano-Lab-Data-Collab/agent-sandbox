@@ -41,6 +41,7 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import (EnvironmentCapabilities,
                                               EnvironmentResourceCapabilities)
 from harbor.environments.definition import effective_exec_cwd
+from harbor.models.task.config import NetworkMode
 from harbor.models.trial.config import ResourceMode
 from harbor.models.trial.paths import EnvironmentPaths
 
@@ -112,10 +113,11 @@ class AgentSandboxEnvironment(BaseEnvironment):
 
     @property
     def capabilities(self) -> EnvironmentCapabilities:
-        # No stream mode (Harbor does not offer it to import-path environments),
-        # no accelerators in this version, no network allowlists (a
-        # NetworkPolicy cannot express hostnames), no compose, no host mounts.
-        return EnvironmentCapabilities()
+        # A task without internet gets a deny-all NetworkPolicy. No stream mode
+        # (Harbor does not offer it to import-path environments), no
+        # accelerators in this version, no network allowlists (a NetworkPolicy
+        # cannot express hostnames), no compose, no host mounts.
+        return EnvironmentCapabilities(disable_internet=True)
 
     @classmethod
     def resource_capabilities(cls) -> EnvironmentResourceCapabilities:
@@ -247,6 +249,7 @@ class AgentSandboxEnvironment(BaseEnvironment):
         self._pool = await clients.templates.ensure(
             image=self._image, resources=self._resources(),
             workdir=self.task_env_config.workdir or self._dockerfile_workdir,
+            internet=self.network_policy.network_mode != NetworkMode.NO_NETWORK,
             environment_name=self.environment_name, environment_id=self.environment_id)
         self._timings["template_s"] = time.monotonic() - t0
 
