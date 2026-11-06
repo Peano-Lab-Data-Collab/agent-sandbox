@@ -15,7 +15,9 @@ task image needs no agent or server: only `sh`, `bash`, `tar` and `sleep`, plus
 `su` and `getent` when Harbor runs a command as another user, and coreutils
 `timeout` for deadlines (the command still runs without it, then without a
 sandbox-side deadline). Every Debian, Ubuntu and `python` base image has them.
-Terminal-Bench 2.0's 89 tasks all ship a prebuilt image and run unchanged.
+Terminal-Bench 2.0's 89 tasks all ship a prebuilt image and run unchanged. A task
+with a `docker-compose.yaml` runs its other services as sidecar containers of the
+same pod (see [Compose tasks](#compose-tasks)).
 
 ## Quick install
 
@@ -34,11 +36,14 @@ has the Role.
 
 ## How a trial runs
 
-1. `start()` resolves the task image (`[environment].docker_image`, optionally
-   through a registry mirror), creates a `SandboxTemplate` and a `SandboxWarmPool`
-   for that image and its resources (once per image per process; a 409 means
+1. `start()` resolves the task image (`[environment].docker_image` or an
+   `image_map` entry, optionally through a registry mirror), creates a
+   `SandboxTemplate` and a `SandboxWarmPool` for that image, its resources and
+   its compose sidecars (once per distinct pod spec per process; a 409 means
    another trial got there first), then creates a `SandboxClaim` with a shutdown
-   time and waits for it to be Ready and to accept exec.
+   time and waits for it to be Ready and to accept exec. The claim is Ready
+   when the pod is, so a sidecar with a healthcheck holds the claim until it is
+   healthy.
 2. `exec()` runs `bash -c <command>` through the pod exec API with Harbor's cwd,
    env, `user` (`su`) and `timeout_sec` (coreutils `timeout`, exit 124), the
    same contract as Harbor's own Kubernetes provider.
@@ -46,6 +51,10 @@ has the Role.
    `upload_file()` and `download_file()` use the same path with one member.
 4. `stop(delete=True)` deletes the claim; `--no-delete` keeps it and logs the
    `kubectl exec` command to inspect the pod.
+
+The `main` container keeps its image's `ENTRYPOINT` and runs `sleep infinity` as
+its arguments, as Harbor's Docker and GKE providers do. Exec always targets the
+`main` container.
 
 The pod runs as root (Harbor installs agents and uses `su`), with
 `automountServiceAccountToken: false`, the task's CPU, memory and storage as
@@ -70,7 +79,7 @@ A task environment without internet (`network_mode = "no-network"`, or the older
 | `tolerations` | none | JSON list of tolerations. |
 | `image_pull_secret` | none | Pull secret name in `namespace`. |
 | `image_mirror` | none | Registry prefix that replaces the image's registry (Docker Hub shorthand expands to `library/`). |
-| `image_map` | none | JSON file `{environment_id or task name: image}` for tasks without `docker_image`. |
+| `image_map` | none | JSON file `{environment_id or task name: image}` for tasks without `docker_image`. A value is the image of the `main` container, or an object `{"main": image, "<service>": image}` that also names the image of each compose service that has `build:`. |
 | `warm_replicas` | `0` | Pods kept ready per task image; `0` cold-starts each claim. |
 | `cpu_limit_multiplier` | `1.0` | CPU limit as a multiple of the request; `0` sets none. |
 | `memory_limit_multiplier` | `1.0` | Memory limit as a multiple of the request; `0` sets none. |
@@ -148,13 +157,143 @@ python -m k8s_agent_sandbox_harbor cleanup --namespace harbor --all      # claim
 
 Both select only objects labelled `harbor.io/managed-by=k8s-agent-sandbox-harbor`.
 
+## Compose tasks
+
+A task's `docker-compose.yaml` describes services that Docker would run in
+separate containers on one network. This environment runs them as containers of
+the sandbox pod, which share one network namespace, so a sidecar listens on
+`localhost` and the pod's `hostAliases` resolve each service name to
+`127.0.0.1`. The environment reads these keys and rejects the rest, naming the
+file, the service and the key, before it creates a claim:
+
+| Service | Keys |
+| --- | --- |
+| `main` | `environment`, `cap_add` (only `NET_ADMIN` and `NET_RAW`), `depends_on`, and `build` and `image`, which it ignores because the image comes from `docker_image` or `image_map`. |
+| Every other service | `image`, `build`, `environment`, `expose`, `healthcheck`, `command`, `depends_on`, `platform` (`linux/amd64` or `linux/arm64`, the same on every service that sets it), and `deploy.resources.limits` with `cpus` and `memory`. |
+
+Compose behavior that carries over:
+
+- `${VAR}`, `${VAR:-default}` and `$$` read the environment of the `harbor`
+  process, when the environment object is created. A `${` inside a default,
+  such as `${A:-${B}}`, is rejected.
+- `main` gets `environment` as container variables and `cap_add` as added
+  capabilities, so a task can ask for `NET_ADMIN`. Other capabilities are
+  rejected because `main` runs as root.
+- `platform` becomes the pod's `kubernetes.io/arch` node selector, next to
+  `node_selector`. A `node_selector` that sets another architecture makes the
+  environment fail when it is created.
+- A `healthcheck` becomes an exec readiness probe. `interval` and `timeout`
+  round up to whole seconds. `retries`, `start_period` and `start_interval` are
+  ignored: the probe runs until it passes or `ready_timeout_s` ends the wait.
+- `command` replaces the image's `CMD` and keeps its `ENTRYPOINT`.
+- `deploy.resources.limits` become the sidecar's limits, and Kubernetes sets its
+  requests to the same values. The node needs room for `main` and every sidecar.
+
+Compose behavior that does not:
+
+- A `depends_on` order is not kept, because the containers start together. A
+  `service_healthy` condition holds because the claim waits for every probe.
+- Services share a network namespace, so two services cannot listen on the same
+  port.
+- A sidecar runs as uid 0 like `main` while `run_as_root` is on, even when its
+  image sets a `USER`.
+- Harbor's `--extra-docker-compose` and per-service exec, artifacts and collect
+  hooks are not supported, so `capabilities.docker_compose` stays off.
+
+A service with `build:` runs the image in `image_map`, as Compose runs the image
+it builds, even when it also sets `image:`. A service with only `image:` uses
+that image. `tools/build_task_images.py` in this directory of the repository
+builds the images and writes the map. It is not part of the installed package.
+
+```bash
+python <agent-sandbox>/clients/integrations/harbor/tools/build_task_images.py --tasks-dir <tasks> \
+  --registry us-central1-docker.pkg.dev/<project>/<repo> \
+  --image-map image-map.json --jobs 4 --skip-existing
+```
+
+It builds `environment/` as `main` and every service with `build:` for
+`linux/amd64`, pushes `<registry>/<task>:<service>`, and writes
+`{"<task>": {"main": ..., "<service>": ...}}` with each image as
+`<registry>/<task>:<service>@sha256:<digest>`. The digest makes a node pull the
+image that was just pushed, not an earlier push of the same tag that the node
+cached. The map uses the task's short name, which is the last part of
+`[task].name` and Harbor's `environment_name`. It needs the `docker` CLI with
+buildx and PyYAML. `--from-rewrite 'REGEX=REPLACEMENT'` edits
+the image of every `FROM` line, repeatable and applied in order; the script
+builds from an edited copy of each Dockerfile and leaves the tasks untouched.
+`--skip-existing` skips tags the registry already has and records the digest the
+tag points to, which also skips an image whose Dockerfile changed since it was
+pushed. `--dry-run` prints the commands
+and the `FROM` lines it would change.
+
+## CyberGym
+
+[CyberGym](https://github.com/harbor-framework/harbor/tree/main/adapters/cybergym)
+gives the agent a vulnerable C or C++ project and asks for an input that crashes
+it. Each task has a `main` image with the agent's tools and a `task-server`
+service that holds the vulnerable and fixed binaries and scores each submission.
+The agent's `ENTRYPOINT` applies an iptables allowlist that needs `NET_ADMIN`,
+which is why `main` keeps its `ENTRYPOINT` and receives the added capability.
+
+1. Generate the tasks with the Harbor adapter. It needs network access to
+   HuggingFace for metadata.
+
+   ```bash
+   git clone --depth 1 https://github.com/harbor-framework/harbor
+   cd harbor/adapters/cybergym
+   python run_adapter.py --output-dir ../../datasets/cybergym --subset \
+     --exclude-task-ids oss-fuzz:385167047
+   ```
+
+   The tasks land in `datasets/cybergym/level1/`.
+
+2. Build and push the images. This example pulls the ARVO base images from a
+   private mirror of `n132/arvo`:
+
+   ```bash
+   python <agent-sandbox>/clients/integrations/harbor/tools/build_task_images.py --tasks-dir datasets/cybergym/level1 \
+     --registry us-central1-docker.pkg.dev/<project>/<repo>/cybergym \
+     --from-rewrite '^n132/arvo:(\d+)-(vul|fix)$=us-central1-docker.pkg.dev/<project>/<repo>/arvo/\1:\2' \
+     --image-map image-map.json --skip-existing
+   ```
+
+3. Run with the image map. Set `ALLOWED_HOSTS` and the `*_BASE_URL` variables
+   that the compose file lists in the environment of `harbor`: they pick the
+   hosts the agent's network allowlist keeps open.
+
+   ```bash
+   ALLOWED_HOSTS=llm-gateway.example.com harbor run -p datasets/cybergym/level1 \
+     -a <agent> -m <model> -e k8s_agent_sandbox_harbor:AgentSandboxEnvironment \
+     --ek namespace=harbor --ek image_map=image-map.json --ek ready_timeout_s=3600
+   ```
+
+Notes:
+
+- Do not pass `--ek image_mirror`. It replaces the registry host of every image,
+  so it would rewrite the Artifact Registry names in the map into paths under
+  the mirror.
+- Use a node pool with the default `runc` runtime, not gVisor. The allowlist
+  script skips itself when `iptables` fails, and the agent would then run with
+  open egress.
+- Raise `ready_timeout_s` well above the default. The claim is Ready only after
+  the node has pulled both multi-gigabyte images and the `task-server` passes
+  its healthcheck.
+- A pod requests the CPU and memory of `main` plus the `task-server` limits, 2
+  CPUs and 4096 MiB each in the adapter's files.
+- The adapter writes a new `AUTH_TOKEN` into `docker-compose.yaml`, `test.sh` and
+  `solve.sh` each time it runs. The images do not contain the token, so one set
+  of pushed images serves every generation of the tasks.
+- The template name hashes the sidecar environment, so a different
+  `ALLOWED_HOSTS` creates another template and pool.
+
 ## Limits
 
-- Harbor's stream mode, Docker Compose tasks, GPU and TPU tasks and network
-  allowlists are not supported; `_validate_definition` rejects them before a
-  claim is created.
-- Images are not built. A task that ships only a Dockerfile needs an
-  `image_map` entry built elsewhere.
+- Harbor's stream mode, GPU and TPU tasks and network allowlists are not
+  supported. Compose tasks that use keys outside the table above are not
+  supported either. `_validate_definition` rejects all of them before a claim is
+  created.
+- Images are not built here. A task that ships only a Dockerfile needs an
+  `image_map` entry, which `tools/build_task_images.py` can produce.
 - Harbor's pod labels are not forwarded to the pod: the controller admits pod
   labels from an allowlisted domain only. Claims, templates and pools carry the
   `harbor.io/*` labels.
