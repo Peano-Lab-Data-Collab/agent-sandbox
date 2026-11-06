@@ -30,6 +30,8 @@ from k8s_agent_sandbox_harbor.templates import POOLS, TEMPLATES, EgressServiceEr
 
 from .fake_k8s import make_service
 
+from .compose_samples import CYBERGYM_COMPOSE
+
 SESSION = "hello-world__bZZeEkw__env"
 
 
@@ -49,10 +51,11 @@ def test_is_a_harbor_environment_with_static_capabilities(task_dir, trial_paths,
     assert env.claim_name.startswith("hb-trial-") and len(env.claim_name) <= 63
 
 
-def test_validate_definition_rejects_compose_and_imageless_tasks(task_dir, trial_paths, env_config):
+def test_validate_definition_rejects_unsupported_compose_and_imageless_tasks(
+        task_dir, trial_paths, env_config):
     env_dir = task_dir / "task" / "environment"
-    (env_dir / "docker-compose.yaml").write_text("services: {}")
-    with pytest.raises(ValueError, match="docker-compose"):
+    (env_dir / "docker-compose.yaml").write_text("services:\n  main:\n    ports: ['80:80']\n")
+    with pytest.raises(ValueError, match=r"docker-compose.yaml.*'main'.*'ports'"):
         make_env(task_dir, trial_paths, env_config)
     (env_dir / "docker-compose.yaml").unlink()
     with pytest.raises(ImageUnavailableError, match="image_map"):
@@ -418,3 +421,114 @@ async def test_a_failed_create_deletes_the_named_claim(task_dir, trial_paths, en
         await env.start(force_build=False)
     assert deleted == [(env.claim_name, "harbor")]
     await env.stop(delete=True)                              # nothing to delete, no error
+
+
+CYBERGYM_TASK = "cybergym_arvo_1065"
+
+
+def cybergym_env(task_dir: Path, trial_paths, images: dict, **kwargs) -> AgentSandboxEnvironment:
+    """A CyberGym-shaped task: a Dockerfile-only main image, the adapter's compose
+    file, and an image map written by the build script."""
+    env_dir = task_dir / "task" / "environment"
+    (env_dir / "docker-compose.yaml").write_text(CYBERGYM_COMPOSE)
+    image_map = task_dir / "images.json"
+    image_map.write_text(json.dumps(images))
+    return AgentSandboxEnvironment(
+        environment_dir=env_dir, environment_name=CYBERGYM_TASK, session_id=SESSION,
+        trial_paths=trial_paths, task_env_config=EnvironmentConfig(cpus=2, memory_mb=4096),
+        image_map=str(image_map), **kwargs)
+
+
+CYBERGYM_IMAGES = {CYBERGYM_TASK: {"main": "reg/cg:main", "task-server": "reg/cg:task-server"}}
+
+
+async def test_a_compose_task_runs_its_services_as_sidecars_of_one_pod(
+        task_dir, trial_paths, fake_clients, monkeypatch):
+    monkeypatch.setenv("ALLOWED_HOSTS", "llm.example.com")
+    env = cybergym_env(task_dir, trial_paths, CYBERGYM_IMAGES)
+    await env.start(force_build=False)
+
+    custom, sc = fake_clients["custom"], fake_clients["sandbox_client"]
+    pod = custom.objects[(TEMPLATES, env._pool)]["spec"]["podTemplate"]["spec"]
+    main, task_server = pod["containers"]
+    assert (main["name"], main["image"]) == ("main", "reg/cg:main")
+    assert main["args"] == ["sleep", "infinity"] and "command" not in main
+    assert {"name": "ALLOWED_HOSTS", "value": "llm.example.com"} in main["env"]
+    assert main["securityContext"]["capabilities"] == {"add": ["NET_ADMIN"]}
+    assert (task_server["name"], task_server["image"]) == ("task-server", "reg/cg:task-server")
+    assert task_server["env"] == [{"name": "AUTH_TOKEN", "value": "f7748496b9e994156c685b4bf7c7afb8"}]
+    assert task_server["readinessProbe"]["exec"]["command"][:2] == ["python3", "-c"]
+    assert task_server["resources"] == {"limits": {"cpu": "2", "memory": "4096Mi"}}
+    assert pod["hostAliases"] == [{"ip": "127.0.0.1", "hostnames": ["task-server"]}]
+    assert pod["nodeSelector"] == {"kubernetes.io/arch": "amd64"}
+    assert len(sc.created) == 1 and sc.created[0]["warmpool"] == env._pool
+    # The environment still execs into the main container.
+    assert fake_clients["transport"].pod == "sb-1-pod"
+
+
+async def test_compose_env_that_differs_gets_its_own_template(task_dir, trial_paths, fake_clients,
+                                                              monkeypatch):
+    monkeypatch.delenv("ALLOWED_HOSTS", raising=False)
+    first = cybergym_env(task_dir, trial_paths, CYBERGYM_IMAGES)
+    monkeypatch.setenv("ALLOWED_HOSTS", "llm.example.com")
+    second = cybergym_env(task_dir, trial_paths, CYBERGYM_IMAGES)
+    await first.start(force_build=False)
+    await second.start(force_build=False)
+    assert first._pool != second._pool
+    assert len([k for k in fake_clients["custom"].objects if k[0] == TEMPLATES]) == 2
+
+
+def test_a_build_only_service_without_an_image_map_entry_fails_before_a_claim(task_dir, trial_paths):
+    with pytest.raises(ImageUnavailableError, match=rf"{CYBERGYM_TASK}.*'task-server'"):
+        cybergym_env(task_dir, trial_paths, {CYBERGYM_TASK: "reg/cg:main"})
+    with pytest.raises(ImageUnavailableError, match="image_map"):
+        cybergym_env(task_dir, trial_paths, {})
+
+
+def test_an_unsupported_compose_key_fails_in_the_constructor(task_dir, trial_paths):
+    env_dir = task_dir / "task" / "environment"
+    (env_dir / "docker-compose.yaml").write_text(
+        "services:\n  helper:\n    image: busybox\n    volumes: ['/data:/data']\n")
+    with pytest.raises(ValueError) as err:
+        make_env(task_dir, trial_paths, EnvironmentConfig(docker_image="i", cpus=1, memory_mb=1024))
+    assert all(part in str(err.value) for part in ("docker-compose.yaml", "'helper'", "'volumes'"))
+
+
+async def test_a_sidecar_with_an_image_needs_no_image_map(task_dir, trial_paths, env_config,
+                                                          fake_clients):
+    env_dir = task_dir / "task" / "environment"
+    (env_dir / "docker-compose.yaml").write_text(
+        "services:\n  cache:\n    image: redis:7\n    command: redis-server --save ''\n")
+    env = make_env(task_dir, trial_paths, env_config)
+    await env.start(force_build=False)
+    pod = fake_clients["custom"].objects[(TEMPLATES, env._pool)]["spec"]["podTemplate"]["spec"]
+    assert pod["containers"][1] == {"name": "cache", "image": "redis:7",
+                                    "args": ["redis-server", "--save", ""]}
+
+
+def test_a_node_selector_for_another_architecture_fails_in_the_constructor(task_dir, trial_paths):
+    with pytest.raises(ValueError, match=r"kubernetes.io/arch=arm64.*linux/amd64"):
+        cybergym_env(task_dir, trial_paths, CYBERGYM_IMAGES,
+                     node_selector="kubernetes.io/arch=arm64")
+
+
+async def test_a_service_with_build_runs_the_mapped_image_not_its_compose_image(
+        task_dir, trial_paths, fake_clients):
+    env_dir = task_dir / "task" / "environment"
+    (env_dir / "docker-compose.yaml").write_text(
+        "services:\n  cache:\n    image: redis:7\n    build: ./cache\n")
+    image_map = task_dir / "images.json"
+    image_map.write_text(json.dumps({"hello-world": {"cache": "reg/hw:cache@sha256:abc"}}))
+    env = make_env(task_dir, trial_paths, EnvironmentConfig(docker_image="i", cpus=1, memory_mb=1024),
+                   image_map=str(image_map))
+    await env.start(force_build=False)
+    pod = fake_clients["custom"].objects[(TEMPLATES, env._pool)]["spec"]["podTemplate"]["spec"]
+    assert pod["containers"][1]["image"] == "reg/hw:cache@sha256:abc"
+
+
+def test_a_service_with_build_and_image_still_needs_an_image_map_entry(task_dir, trial_paths):
+    env_dir = task_dir / "task" / "environment"
+    (env_dir / "docker-compose.yaml").write_text(
+        "services:\n  cache:\n    image: redis:7\n    build: ./cache\n")
+    with pytest.raises(ImageUnavailableError, match="task 'hello-world'.*service 'cache'"):
+        make_env(task_dir, trial_paths, EnvironmentConfig(docker_image="i", cpus=1, memory_mb=1024))

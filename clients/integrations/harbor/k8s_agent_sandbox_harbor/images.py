@@ -18,6 +18,12 @@ Harbor environments acquire their own image. This package does not build:
 a task must name a prebuilt ``docker_image`` (as every Terminal-Bench 2.0 task
 does), or an image map must list one for it. An optional mirror prefix moves
 pulls off Docker Hub.
+
+An image map entry is either one image for the main container or an object
+that adds an image for each compose service that has ``build:``::
+
+    {"cybergym_arvo_1065": {"main": "reg/cybergym_arvo_1065:main",
+                            "task-server": "reg/cybergym_arvo_1065:task-server"}}
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from pathlib import Path
 from .options import EnvironmentOptions
 
 _HUB_HOSTS = ("docker.io", "index.docker.io", "registry-1.docker.io")
+_MAIN = "main"
 
 
 class ImageUnavailableError(RuntimeError):
@@ -58,9 +65,11 @@ class ImageResolver:
 
     def __init__(self, options: EnvironmentOptions):
         self._options = options
-        self._map: dict[str, str] | None = None
+        self._map: dict[str, dict[str, str]] | None = None
 
-    def _image_map(self) -> dict[str, str]:
+    def _image_map(self) -> dict[str, dict[str, str]]:
+        """The image map with every entry as ``{service: image}``; a plain
+        string entry is the image of ``main``."""
         if self._map is None:
             path = self._options.image_map
             if path is None:
@@ -69,16 +78,17 @@ class ImageResolver:
                 data = json.loads(Path(path).read_text())
                 if not isinstance(data, dict):
                     raise ValueError(f"image_map {path} must hold a JSON object")
-                self._map = {str(k): str(v) for k, v in data.items()}
+                self._map = {str(k): _parse_entry(path, k, v) for k, v in data.items()}
         return self._map
+
+    def _entry(self, environment_id: str, environment_name: str) -> dict[str, str]:
+        mapping = self._image_map()
+        return mapping.get(environment_id) or mapping.get(environment_name) or {}
 
     def resolve(self, *, docker_image: str | None, environment_id: str,
                 environment_name: str, has_dockerfile: bool) -> str:
         """The image to run, mirrored when a mirror is configured."""
-        image = docker_image
-        if not image:
-            mapping = self._image_map()
-            image = mapping.get(environment_id) or mapping.get(environment_name)
+        image = docker_image or self._entry(environment_id, environment_name).get(_MAIN)
         if not image:
             how = ("build its environment/Dockerfile, push it, and list it in "
                    "--ek image_map=<file>" if has_dockerfile
@@ -87,3 +97,27 @@ class ImageResolver:
                 f"task {environment_name!r} ({environment_id}) has no prebuilt image: "
                 f"{how}. This environment does not build images.")
         return rewrite_registry(image, self._options.image_mirror)
+
+    def resolve_service(self, service: str, *, compose_image: str | None, environment_id: str,
+                        environment_name: str) -> str:
+        """The image of a compose service other than ``main``, mirrored when a
+        mirror is configured. ``compose_image`` is the compose ``image:`` of a service
+        without ``build:``. A service with ``build:`` passes None and gets its
+        image from the map, because Compose runs the image it builds."""
+        image = compose_image or self._entry(environment_id, environment_name).get(service)
+        if not image:
+            raise ImageUnavailableError(
+                f"task {environment_name!r} ({environment_id}) service {service!r} has no "
+                f"prebuilt image: build its compose context, push it, and list it as "
+                f"{service!r} in the task's object entry of --ek image_map=<file>. "
+                f"This environment does not build images.")
+        return rewrite_registry(image, self._options.image_mirror)
+
+
+def _parse_entry(path: str, key: str, value: object) -> dict[str, str]:
+    if isinstance(value, str):
+        return {_MAIN: value}
+    if isinstance(value, dict):
+        return {str(service): str(image) for service, image in value.items()}
+    raise ValueError(f"image_map {path}: the entry for {key!r} must be an image string or an "
+                     f"object of service images")

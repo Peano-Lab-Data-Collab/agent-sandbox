@@ -16,6 +16,7 @@ dependencies = [
     # 36.0.0 stores the in-cluster token where its API client does not read it.
     "kubernetes>=32.0.0,!=36.0.0",
     "pydantic>=2",
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]

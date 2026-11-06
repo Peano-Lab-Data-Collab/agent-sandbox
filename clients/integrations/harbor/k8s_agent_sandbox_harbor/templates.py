@@ -14,7 +14,8 @@
 
 """One SandboxTemplate and one SandboxWarmPool per task image.
 
-A Harbor task names an image and its resources. The template renders that as
+A Harbor task names an image and its resources, and may add compose services
+that run as sidecar containers of the same pod. The template renders that as
 the pod the controller runs, the pool is the claim target (``replicas: 0``
 means every claim cold-starts from the template, ``warm_replicas`` keeps pods
 ready). Objects are named by a hash of the rendered spec, the replica count and the
@@ -29,6 +30,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from .compose import ComposeSpec, Sidecar
 from .labels import (ANNOTATION_ENVIRONMENT_ID, ANNOTATION_IMAGE, LABEL_ENVIRONMENT,
                      LABEL_IMAGE_HASH, LABEL_MANAGED_BY, MANAGED_BY_VALUE, label_value,
                      object_name, short_hash)
@@ -40,6 +42,7 @@ TEMPLATES = "sandboxtemplates"
 POOLS = "sandboxwarmpools"
 CLAIMS = "sandboxclaims"
 CONTAINER = "main"
+ARCH_LABEL = "kubernetes.io/arch"
 
 # Private ranges the controller's default policy blocks; kept blocked here so
 # a task reaches the internet and cluster DNS, and nothing else inside the VPC.
@@ -210,8 +213,40 @@ def template_network_policy(options: EnvironmentOptions, internet: bool,
     return {"ingress": [], "egress": egress}
 
 
+def render_sidecar(sidecar: Sidecar) -> dict[str, Any]:
+    container: dict[str, Any] = {"name": sidecar.name, "image": sidecar.image}
+    if sidecar.args is not None:
+        container["args"] = list(sidecar.args)
+    if sidecar.env:
+        container["env"] = [{"name": k, "value": v} for k, v in sidecar.env]
+    if sidecar.readiness:
+        probe = sidecar.readiness
+        container["readinessProbe"] = {"exec": {"command": list(probe.command)},
+                                       "periodSeconds": probe.period_s,
+                                       "timeoutSeconds": probe.timeout_s}
+    limits = {k: v for k, v in (("cpu", sidecar.cpu_limit), ("memory", sidecar.memory_limit)) if v}
+    if limits:
+        # Kubernetes sets the requests equal to the limits.
+        container["resources"] = {"limits": limits}
+    return container
+
+
+def pod_node_selector(options: EnvironmentOptions, compose: ComposeSpec | None) -> dict[str, str]:
+    """``options.node_selector`` plus the architecture the compose ``platform``
+    asks for. Raises ``ValueError`` when the node selector already names another
+    architecture, because neither setting should win silently."""
+    selector = dict(options.node_selector)
+    if compose and compose.platform:
+        arch = compose.platform.partition("/")[2]
+        if selector.setdefault(ARCH_LABEL, arch) != arch:
+            raise ValueError(f"node_selector sets {ARCH_LABEL}={selector[ARCH_LABEL]} but the "
+                             f"compose file asks for platform {compose.platform}")
+    return selector
+
+
 def render_pod_spec(image: str, resources: ResourceSpec, options: EnvironmentOptions,
-                    workdir: str | None, service: ResolvedService | None = None) -> dict[str, Any]:
+                    workdir: str | None, service: ResolvedService | None = None,
+                    compose: ComposeSpec | None = None) -> dict[str, Any]:
     container: dict[str, Any] = {
         "name": CONTAINER,
         "image": image,
@@ -226,25 +261,38 @@ def render_pod_spec(image: str, resources: ResourceSpec, options: EnvironmentOpt
     res = resources.as_resources()
     if res:
         container["resources"] = res
-    if options.run_as_root:
-        container["securityContext"] = {"runAsUser": 0, "runAsGroup": 0}
+    security: dict[str, Any] = {"runAsUser": 0, "runAsGroup": 0} if options.run_as_root else {}
+    if compose and compose.main_capabilities:
+        security["capabilities"] = {"add": list(compose.main_capabilities)}
+    if security:
+        container["securityContext"] = security
+    if compose and compose.main_env:
+        container["env"] = [{"name": k, "value": v} for k, v in compose.main_env]
     spec: dict[str, Any] = {
         "automountServiceAccountToken": False,
         "containers": [container],
     }
-    if options.run_as_root:
-        spec["securityContext"] = {"runAsUser": 0, "runAsGroup": 0}
+    host_aliases: list[dict[str, Any]] = []
+    if compose and compose.sidecars:
+        spec["containers"].extend(render_sidecar(s) for s in compose.sidecars)
+        # Containers of a pod share one network namespace, so a service name
+        # resolves to localhost where Compose resolved it to a container IP.
+        host_aliases.append({"ip": "127.0.0.1",
+                             "hostnames": [s.name for s in compose.sidecars]})
+    if service is not None:
+        # The pod may not query DNS, so the Service's names resolve from its hosts file.
+        host_aliases.append({"ip": service.cluster_ip, "hostnames": service.hostnames})
+    if host_aliases:
+        spec["hostAliases"] = host_aliases
     if options.runtime_class:
         spec["runtimeClassName"] = options.runtime_class
-    if options.node_selector:
-        spec["nodeSelector"] = dict(options.node_selector)
+    node_selector = pod_node_selector(options, compose)
+    if node_selector:
+        spec["nodeSelector"] = node_selector
     if options.tolerations:
         spec["tolerations"] = [dict(t) for t in options.tolerations]
     if options.image_pull_secret:
         spec["imagePullSecrets"] = [{"name": options.image_pull_secret}]
-    if service is not None:
-        # The pod may not query DNS, so the Service's names resolve from its hosts file.
-        spec["hostAliases"] = [{"ip": service.cluster_ip, "hostnames": service.hostnames}]
     return spec
 
 
@@ -255,11 +303,12 @@ def common_labels(options: EnvironmentOptions) -> dict[str, str]:
 def render_template(*, name: str, namespace: str, image: str, resources: ResourceSpec,
                     options: EnvironmentOptions, workdir: str | None, internet: bool,
                     environment_name: str, environment_id: str,
-                    service: ResolvedService | None = None) -> dict[str, Any]:
+                    service: ResolvedService | None = None,
+                    compose: ComposeSpec | None = None) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "podTemplate": {
             "metadata": {"labels": common_labels(options)},
-            "spec": render_pod_spec(image, resources, options, workdir, service),
+            "spec": render_pod_spec(image, resources, options, workdir, service, compose),
         },
     }
     network_policy = template_network_policy(options, internet, service)
@@ -293,12 +342,13 @@ def render_pool(*, name: str, namespace: str, template_name: str, replicas: int,
 
 def template_name_for(options: EnvironmentOptions, image: str, resources: ResourceSpec,
                       workdir: str | None, *, internet: bool,
-                      service: ResolvedService | None = None) -> str:
+                      service: ResolvedService | None = None,
+                      compose: ComposeSpec | None = None) -> str:
     """Name from everything that shapes the pair, so equal inputs share one
     template and pool, and a changed input (a new image, other resources, a
-    different replica count, labels, network policy or egress Service) gets a
-    new pair instead of a silent reuse."""
-    pod = render_pod_spec(image, resources, options, workdir, service)
+    different replica count, labels, network policy, egress Service or compose
+    services) gets a new pair instead of a silent reuse."""
+    pod = render_pod_spec(image, resources, options, workdir, service, compose)
     network = template_network_policy(options, internet, service)
     key = json.dumps({"pod": pod, "network": network,
                       "replicas": options.warm_replicas, "labels": common_labels(options)},
@@ -345,10 +395,11 @@ class TemplateStore:
 
     async def ensure(self, *, image: str, resources: ResourceSpec, workdir: str | None,
                      internet: bool, environment_name: str, environment_id: str,
-                     service: ResolvedService | None = None) -> str:
+                     service: ResolvedService | None = None,
+                     compose: ComposeSpec | None = None) -> str:
         """Return the pool name for ``image``, creating template and pool if needed."""
         name = template_name_for(self._options, image, resources, workdir, internet=internet,
-                                 service=service)
+                                 service=service, compose=compose)
         if name in self._ready:
             return name
         async with self._lock(name):
@@ -357,8 +408,8 @@ class TemplateStore:
             template = render_template(
                 name=name, namespace=self._namespace, image=image, resources=resources,
                 options=self._options, workdir=workdir, internet=internet,
-                environment_name=environment_name,
-                environment_id=environment_id, service=service)
+                environment_name=environment_name, environment_id=environment_id,
+                service=service, compose=compose)
             created = await self._create(TEMPLATES, template)
             pool = render_pool(name=name, namespace=self._namespace, template_name=name,
                                replicas=self._options.warm_replicas,

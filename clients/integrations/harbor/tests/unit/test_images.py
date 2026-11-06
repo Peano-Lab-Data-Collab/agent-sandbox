@@ -52,3 +52,56 @@ def test_resolver_prefers_docker_image_then_map_then_errors(tmp_path):
     with pytest.raises(ImageUnavailableError, match="docker_image"):
         ImageResolver(EnvironmentOptions()).resolve(docker_image=None, environment_id="z",
                                                     environment_name="o", has_dockerfile=False)
+
+
+def test_object_form_map_entries_give_main_and_service_images(tmp_path):
+    env_map = tmp_path / "images.json"
+    env_map.write_text(json.dumps({
+        "cybergym_arvo_1065": {"main": "reg/t:main", "task-server": "reg/t:task-server"},
+        "plain": "reg/plain:1"}))
+    r = ImageResolver(EnvironmentOptions(image_map=str(env_map)))
+    assert r.resolve(docker_image=None, environment_id="x", environment_name="cybergym_arvo_1065",
+                     has_dockerfile=True) == "reg/t:main"
+    assert r.resolve_service("task-server", compose_image=None, environment_id="x",
+                             environment_name="cybergym_arvo_1065") == "reg/t:task-server"
+    # The string form still names the main image.
+    assert r.resolve(docker_image=None, environment_id="x", environment_name="plain",
+                     has_dockerfile=True) == "reg/plain:1"
+
+
+def test_a_build_only_service_needs_a_map_entry(tmp_path):
+    env_map = tmp_path / "images.json"
+    env_map.write_text(json.dumps({"t": "reg/t:main", "u": {"main": "reg/u:main"}}))
+    r = ImageResolver(EnvironmentOptions(image_map=str(env_map)))
+    for name in ("t", "u", "unknown"):
+        with pytest.raises(ImageUnavailableError, match=rf"task '{name}'.*service 'task-server'"):
+            r.resolve_service("task-server", compose_image=None, environment_id="x",
+                              environment_name=name)
+    with pytest.raises(ImageUnavailableError, match="task 't'"):
+        ImageResolver(EnvironmentOptions()).resolve_service(
+            "task-server", compose_image=None, environment_id="x", environment_name="t")
+
+
+def test_a_service_with_an_image_needs_no_map_and_goes_through_the_mirror():
+    r = ImageResolver(EnvironmentOptions(image_mirror=M))
+    assert r.resolve_service("db", compose_image="postgres:16", environment_id="x",
+                             environment_name="t") == f"{M}/library/postgres:16"
+
+
+def test_an_image_map_entry_must_be_a_string_or_an_object(tmp_path):
+    env_map = tmp_path / "images.json"
+    env_map.write_text(json.dumps({"t": ["reg/t:main"]}))
+    with pytest.raises(ValueError, match="'t'"):
+        ImageResolver(EnvironmentOptions(image_map=str(env_map))).resolve(
+            docker_image=None, environment_id="x", environment_name="t", has_dockerfile=True)
+
+
+def test_a_digest_pinned_map_value_reaches_the_pod_unchanged_without_a_mirror(tmp_path):
+    pinned = "reg/t:task-server@sha256:" + "a" * 64
+    env_map = tmp_path / "images.json"
+    env_map.write_text(json.dumps({"t": {"main": "reg/t:main@sha256:" + "b" * 64,
+                                         "task-server": pinned}}))
+    r = ImageResolver(EnvironmentOptions(image_map=str(env_map)))
+    assert r.resolve_service("task-server", compose_image=None, environment_id="x",
+                             environment_name="t") == pinned
+    assert rewrite_registry(pinned, None) == pinned

@@ -16,6 +16,7 @@
 
 import pytest
 
+from k8s_agent_sandbox_harbor.compose import ComposeSpec, Readiness, Sidecar
 from k8s_agent_sandbox_harbor.labels import LABEL_MANAGED_BY, MANAGED_BY_VALUE
 from k8s_agent_sandbox_harbor.options import EgressService, EnvironmentOptions
 from k8s_agent_sandbox_harbor.templates import (CLAIMS, POOLS, TEMPLATES, EgressServiceError,
@@ -24,6 +25,13 @@ from k8s_agent_sandbox_harbor.templates import (CLAIMS, POOLS, TEMPLATES, Egress
                                                 resolve_egress_service, template_name_for)
 
 from .fake_k8s import FakeCoreV1, FakeCustomObjects, make_service
+
+TASK_SERVER = Sidecar(
+    name="task-server", image="reg/t:task-server", args=("python3", "-u", "/srv.py"),
+    env=(("AUTH_TOKEN", "tok"),), readiness=Readiness(("python3", "-c", "check"), 3, 5),
+    cpu_limit="2", memory_limit="4096Mi")
+CYBERGYM = ComposeSpec(main_env=(("ALLOWED_HOSTS", "h.example.com"),),
+                       main_capabilities=("NET_ADMIN",), sidecars=(TASK_SERVER,))
 
 RES = ResourceSpec(cpu_request="1", cpu_limit="1", memory_request="2048Mi", memory_limit="2048Mi",
                    storage_request="10240Mi")
@@ -64,6 +72,75 @@ def test_render_template_pod_spec_and_network():
     assert egress[1]["to"][1]["ipBlock"] == {"cidr": "::/0", "except": ["fc00::/7", "fe80::/10"]}
 
 
+def test_compose_renders_sidecars_next_to_the_main_container():
+    t = render_template(name="n", namespace="ns", image="reg/t:main", resources=RES,
+                        options=EnvironmentOptions(), workdir=None, internet=True,
+                        environment_name="t", environment_id="e", compose=CYBERGYM)
+    pod = t["spec"]["podTemplate"]["spec"]
+    main, task_server = pod["containers"]
+    assert main["name"] == "main" and main["args"] == ["sleep", "infinity"]
+    assert main["env"] == [{"name": "ALLOWED_HOSTS", "value": "h.example.com"}]
+    assert main["securityContext"] == {"runAsUser": 0, "runAsGroup": 0,
+                                       "capabilities": {"add": ["NET_ADMIN"]}}
+    assert task_server == {
+        "name": "task-server", "image": "reg/t:task-server",
+        "args": ["python3", "-u", "/srv.py"], "env": [{"name": "AUTH_TOKEN", "value": "tok"}],
+        "readinessProbe": {"exec": {"command": ["python3", "-c", "check"]},
+                           "periodSeconds": 3, "timeoutSeconds": 5},
+        "resources": {"limits": {"cpu": "2", "memory": "4096Mi"}}}
+    assert pod["hostAliases"] == [{"ip": "127.0.0.1", "hostnames": ["task-server"]}]
+    # run_as_root applies to the main container only; a sidecar runs as its image's USER.
+    assert "securityContext" not in pod and "securityContext" not in task_server
+
+
+def test_capabilities_without_root_still_get_a_security_context():
+    compose = ComposeSpec(main_capabilities=("NET_ADMIN",))
+    pod = render_template(name="n", namespace="ns", image="i", resources=ResourceSpec(),
+                          options=EnvironmentOptions(run_as_root=False), workdir=None, internet=True,
+                          environment_name="t", environment_id="e",
+                          compose=compose)["spec"]["podTemplate"]["spec"]
+    assert pod["containers"][0]["securityContext"] == {"capabilities": {"add": ["NET_ADMIN"]}}
+    assert "hostAliases" not in pod and len(pod["containers"]) == 1
+
+
+def render_pod(options, compose):
+    return render_template(name="n", namespace="ns", image="i", resources=ResourceSpec(),
+                           options=options, workdir=None, internet=True, environment_name="t",
+                           environment_id="e", compose=compose)["spec"]["podTemplate"]["spec"]
+
+
+def test_the_compose_platform_becomes_a_node_selector_merged_with_the_users():
+    amd64 = ComposeSpec(platform="linux/amd64")
+    assert render_pod(EnvironmentOptions(), amd64)["nodeSelector"] == {"kubernetes.io/arch": "amd64"}
+    assert render_pod(EnvironmentOptions(node_selector={"pool": "sb"}), amd64)["nodeSelector"] == {
+        "pool": "sb", "kubernetes.io/arch": "amd64"}
+    same = EnvironmentOptions(node_selector={"kubernetes.io/arch": "amd64"})
+    assert render_pod(same, amd64)["nodeSelector"] == {"kubernetes.io/arch": "amd64"}
+    assert "nodeSelector" not in render_pod(EnvironmentOptions(), ComposeSpec())
+
+
+def test_a_node_selector_for_another_architecture_than_the_platform_is_refused():
+    other = EnvironmentOptions(node_selector={"kubernetes.io/arch": "arm64"})
+    with pytest.raises(ValueError, match=r"kubernetes.io/arch=arm64.*linux/amd64"):
+        render_pod(other, ComposeSpec(platform="linux/amd64"))
+
+
+def test_template_name_tracks_the_platform():
+    opts = EnvironmentOptions()
+    assert template_name_for(opts, "i", RES, None, internet=True, compose=ComposeSpec()) != \
+        template_name_for(opts, "i", RES, None, internet=True,
+                          compose=ComposeSpec(platform="linux/amd64"))
+
+
+def test_a_bare_sidecar_leaves_optional_container_fields_out():
+    pod = render_template(name="n", namespace="ns", image="i", resources=ResourceSpec(),
+                          options=EnvironmentOptions(), workdir=None, internet=True,
+                          environment_name="t", environment_id="e",
+                          compose=ComposeSpec(sidecars=(Sidecar(name="db", image="pg:16"),))
+                          )["spec"]["podTemplate"]["spec"]
+    assert pod["containers"][1] == {"name": "db", "image": "pg:16"}
+
+
 def test_managed_default_network_and_no_root_leave_fields_out():
     opts = EnvironmentOptions(network="managed-default", run_as_root=False)
     t = render_template(name="n", namespace="ns", image="i", resources=ResourceSpec(), options=opts,
@@ -93,6 +170,39 @@ def test_a_changed_egress_rule_gets_a_new_template_name(monkeypatch):
     before = template_name_for(EnvironmentOptions(), "img:1", RES, "/app", internet=True)
     monkeypatch.setattr(templates, "dns_public_egress", lambda: [{"to": [{"ipBlock": {"cidr": "1.2.3.4/32"}}]}])
     assert template_name_for(EnvironmentOptions(), "img:1", RES, "/app", internet=True) != before
+
+
+def test_template_name_tracks_the_sidecars():
+    opts = EnvironmentOptions()
+    plain = template_name_for(opts, "img:1", RES, "/app", internet=True)
+    with_sidecar = template_name_for(opts, "img:1", RES, "/app", internet=True, compose=CYBERGYM)
+    assert with_sidecar != plain
+    assert with_sidecar == template_name_for(opts, "img:1", RES, "/app", internet=True,
+                                             compose=CYBERGYM)
+    other_image = ComposeSpec(main_env=CYBERGYM.main_env, main_capabilities=("NET_ADMIN",),
+                              sidecars=(Sidecar(name="task-server", image="reg/t:other"),))
+    assert with_sidecar != template_name_for(opts, "img:1", RES, "/app", internet=True,
+                                             compose=other_image)
+
+
+def test_template_name_tracks_the_digest_of_a_pinned_sidecar_image():
+    opts = EnvironmentOptions()
+
+    def name(digest):
+        sidecar = Sidecar(name="task-server", image=f"reg/t:task-server@sha256:{digest * 64}")
+        return template_name_for(opts, "img:1", RES, None, internet=True,
+                                 compose=ComposeSpec(sidecars=(sidecar,)))
+
+    assert name("a") == name("a") and name("a") != name("b")
+
+
+async def test_store_creates_the_sidecar_pod_once():
+    api = FakeCustomObjects()
+    store = TemplateStore(api, "ns", EnvironmentOptions(namespace="ns"))
+    name = await store.ensure(image="reg/t:main", resources=RES, workdir=None, internet=True,
+                              environment_name="t", environment_id="e", compose=CYBERGYM)
+    containers = api.objects[(TEMPLATES, name)]["spec"]["podTemplate"]["spec"]["containers"]
+    assert [c["name"] for c in containers] == ["main", "task-server"]
 
 
 @pytest.mark.parametrize("network", ["dns-public", "managed-default"])
@@ -231,3 +341,14 @@ async def test_resolve_names_the_missing_permission_on_403_and_the_service_on_40
     with pytest.raises(EgressServiceError,
                        match="proxy-ns/model-proxy.*'get' on 'services' in namespace proxy-ns"):
         await resolve_egress_service(api, WANTED)
+
+
+def test_compose_sidecars_and_an_egress_service_share_the_hosts_file():
+    pod = render_template(name="n", namespace="ns", image="reg/t:main", resources=RES,
+                          options=EnvironmentOptions(), workdir=None, internet=False,
+                          environment_name="t", environment_id="e", service=PROXY,
+                          compose=CYBERGYM)["spec"]["podTemplate"]["spec"]
+    assert pod["hostAliases"] == [
+        {"ip": "127.0.0.1", "hostnames": ["task-server"]},
+        {"ip": "10.96.0.20", "hostnames": ["model-proxy.proxy-ns.svc",
+                                            "model-proxy.proxy-ns.svc.cluster.local"]}]

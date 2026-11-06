@@ -22,8 +22,9 @@ Select it on the Harbor command line by import path::
 Per trial: the task image gets a ``SandboxTemplate`` and a ``SandboxWarmPool``
 (once per image per process), a ``SandboxClaim`` is created against the pool
 and waited for, and every ``exec`` and file transfer goes through the pod exec
-API, so the task image needs nothing installed. ``stop(delete=True)`` deletes
-the claim.
+API, so the task image needs nothing installed. A task's
+``docker-compose.yaml`` becomes sidecar containers of the same pod; exec always
+targets the ``main`` container. ``stop(delete=True)`` deletes the claim.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import shlex
 import time
 from pathlib import Path
@@ -46,11 +48,12 @@ from harbor.models.trial.config import ResourceMode
 from harbor.models.trial.paths import EnvironmentPaths
 
 from . import _clients
+from .compose import ComposeSpec, parse_compose
 from .images import ImageResolver
 from .labels import (ANNOTATION_SESSION, LABEL_ENVIRONMENT, LABEL_TRIAL, label_value,
                      object_name)
 from .options import EnvironmentOptions
-from .templates import (CONTAINER, ResourceSpec, common_labels, cpu_quantity,
+from .templates import (CONTAINER, ResourceSpec, common_labels, cpu_quantity, pod_node_selector,
                         resolve_egress_service)
 from .transport.archive import pack_dir, pack_file, unpack
 from .transport.podexec import PodExecTransport
@@ -96,6 +99,7 @@ class AgentSandboxEnvironment(BaseEnvironment):
         # image, so the resolver exists before super().__init__.
         self._images = ImageResolver(self._options)
         self._image: str | None = None
+        self._compose: ComposeSpec | None = None
         self._sandbox: Any = None
         self._transport: PodExecTransport | None = None
         self._pool: str | None = None
@@ -117,7 +121,9 @@ class AgentSandboxEnvironment(BaseEnvironment):
         # A task without internet gets a deny-all NetworkPolicy. No stream mode
         # (Harbor does not offer it to import-path environments), no
         # accelerators in this version, no network allowlists (a NetworkPolicy
-        # cannot express hostnames), no compose, no host mounts.
+        # cannot express hostnames), no host mounts. docker_compose stays off:
+        # Harbor asks for it only to accept --extra-docker-compose overlays and
+        # to run commands inside a sidecar service, and neither is offered.
         return EnvironmentCapabilities(disable_internet=True)
 
     @classmethod
@@ -172,9 +178,6 @@ class AgentSandboxEnvironment(BaseEnvironment):
                              "the extension controllers)")
 
     def _validate_definition(self) -> None:
-        if (self.environment_dir / _COMPOSE).exists():
-            raise ValueError(f"{self.type()} does not run docker-compose task environments "
-                             f"({self.environment_dir / _COMPOSE})")
         has_dockerfile = (self.environment_dir / _DOCKERFILE).is_file()
         if not self.task_env_config.docker_image and not has_dockerfile:
             raise FileNotFoundError(
@@ -186,6 +189,15 @@ class AgentSandboxEnvironment(BaseEnvironment):
             docker_image=self.task_env_config.docker_image,
             environment_id=self.environment_id, environment_name=self.environment_name,
             has_dockerfile=has_dockerfile)
+        compose_file = self.environment_dir / _COMPOSE
+        if compose_file.is_file():
+            self._compose = parse_compose(
+                compose_file.read_text(), source=f"environment/{_COMPOSE}", environ=os.environ,
+                image_for=lambda service, compose_image: self._images.resolve_service(
+                    service, compose_image=compose_image, environment_id=self.environment_id,
+                    environment_name=self.environment_name))
+            # Fail here, not when the template renders after the trial started.
+            pod_node_selector(self._options, self._compose)
 
     # --- derived values ----------------------------------------------------------
     def _resources(self) -> ResourceSpec:
@@ -256,7 +268,7 @@ class AgentSandboxEnvironment(BaseEnvironment):
             workdir=self.task_env_config.workdir or self._dockerfile_workdir,
             internet=self.network_policy.network_mode != NetworkMode.NO_NETWORK,
             environment_name=self.environment_name, environment_id=self.environment_id,
-            service=service)
+            service=service, compose=self._compose)
         self._timings["template_s"] = time.monotonic() - t0
 
         t1 = time.monotonic()
