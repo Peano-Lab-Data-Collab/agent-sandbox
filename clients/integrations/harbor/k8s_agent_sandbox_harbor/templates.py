@@ -216,8 +216,10 @@ def render_pod_spec(image: str, resources: ResourceSpec, options: EnvironmentOpt
         "name": CONTAINER,
         "image": image,
         # Harbor drives everything through exec; the main process only has to
-        # stay alive. Images that define an ENTRYPOINT are overridden on purpose.
-        "command": ["sleep", "infinity"],
+        # stay alive. Setting args, not command, keeps the image's ENTRYPOINT,
+        # as Harbor's Docker and GKE providers do. Some task images do their
+        # setup there, for example CyberGym's network allowlist.
+        "args": ["sleep", "infinity"],
     }
     if workdir:
         container["workingDir"] = workdir

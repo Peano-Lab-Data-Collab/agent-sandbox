@@ -43,7 +43,8 @@ def test_render_template_pod_spec_and_network():
     c = pod["containers"][0]
     assert t["kind"] == "SandboxTemplate" and t["metadata"]["labels"][LABEL_MANAGED_BY] == MANAGED_BY_VALUE
     assert t["metadata"]["labels"]["team"] == "rl" and t["metadata"]["annotations"]["harbor.io/image"] == "alexgshaw/x:1"
-    assert c["name"] == "main" and c["image"] == "alexgshaw/x:1" and c["command"] == ["sleep", "infinity"]
+    assert c["name"] == "main" and c["image"] == "alexgshaw/x:1" and c["args"] == ["sleep", "infinity"]
+    assert "command" not in c
     assert c["workingDir"] == "/app" and c["securityContext"] == {"runAsUser": 0, "runAsGroup": 0}
     assert c["resources"] == {"requests": {"cpu": "1", "memory": "2048Mi", "ephemeral-storage": "10240Mi"},
                               "limits": {"cpu": "1", "memory": "2048Mi"}}
