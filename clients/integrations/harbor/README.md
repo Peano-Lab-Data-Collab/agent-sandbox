@@ -55,7 +55,8 @@ Harbor verifiers install packages with `apt` and `uv`, so the template carries i
 own egress rule (`--ek network=managed-default` keeps the controller default).
 A task environment without internet (`network_mode = "no-network"`, or the older
 `allow_internet = false`) gets a policy that blocks all traffic instead, whatever
-`network` says.
+`network` says. `egress_service` adds one exception to either policy (see
+[Reaching a Service in the cluster](#reaching-a-service-in-the-cluster)).
 
 ## Options (`--ek key=value`)
 
@@ -80,12 +81,61 @@ A task environment without internet (`network_mode = "no-network"`, or the older
 | `template_prefix` | `hb` | Name prefix of templates, pools and claims. |
 | `extra_labels` | none | `k=v,...` labels on every object created. |
 | `run_as_root` | `true` | Run the pod as uid 0. |
+| `egress_service` | none | `<namespace>/<service>:<port>` of an in-cluster Service that every trial pod may reach. Needs `network=dns-public`. |
 
 Every option also reads a `K8S_SANDBOX_HARBOR_<KEY>` environment variable; an
 `--ek` value wins. A misspelled key is an error that lists the valid ones.
 
 Harbor's own flags apply as usual: `-n` concurrent trials, `-k` attempts,
 `--no-delete`, `--override-memory-mb`, and the resource enforcement policies.
+
+## Reaching a Service in the cluster
+
+An agent often has to call a model proxy that runs in the cluster as a
+Deployment behind a Service, while the trial otherwise has no network. Name the
+Service and its port:
+
+```bash
+harbor run ... -e k8s_agent_sandbox_harbor:AgentSandboxEnvironment \
+    --ek egress_service=llm-proxy/model-proxy:8080
+```
+
+Every trial pod can then open connections to the pods behind that Service, and
+to nothing else beyond what the task's network mode already allows. A task with
+`no-network` gets exactly this one rule. This is an operator exception to the
+task's network mode, so the task's own setting does not turn it off. The port
+is the Service's `port`, the one you would put in a URL.
+
+At the start of each trial the environment reads the Service and renders two
+things into the template.
+
+- An egress rule for the Service's backend pods, matched by the Service's
+  namespace and pod selector, on the Service's `targetPort`. A NetworkPolicy
+  sees the backend pod after the Service has translated the address, so the
+  rule cannot name the cluster IP. The `targetPort` must be a number: GKE
+  Dataplane V2 drops egress to a named port in another namespace, so the
+  environment refuses a Service whose `targetPort` is a port name.
+- A `hostAliases` entry in the pod that maps `<service>.<namespace>.svc` and
+  `<service>.<namespace>.svc.cluster.local` to the Service's cluster IP. The
+  pod resolves the name from its hosts file, so cluster DNS stays closed to
+  the task and no IP is configured by hand.
+
+The environment refuses to start the trial, before it creates a claim, when the
+Service does not exist, has no selector, is headless, or has no port equal to
+the one you gave. The template name includes the cluster IP, selector, target
+port and protocol, so a recreated Service gets a new template and the old one
+is left alone.
+
+Requirements:
+
+- The user running `harbor` needs `get` on `services` in the Service's
+  namespace, in addition to the permissions listed under
+  [Quick install](#quick-install).
+- The cluster must enforce NetworkPolicy (on GKE, Dataplane V2 or network
+  policy enforcement turned on). Without enforcement the template's policy is
+  ignored and every pod can reach everything.
+- `network=managed-default` is rejected together with `egress_service`,
+  because the controller's default policy cannot be extended.
 
 ## Cleanup
 
