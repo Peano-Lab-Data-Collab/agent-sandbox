@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -75,8 +76,30 @@ async def _async_api_client(context: str | None) -> async_client.ApiClient:
     try:
         async_config.load_incluster_config(client_configuration=configuration)
     except async_config.ConfigException:
-        await async_config.load_kube_config(context=context, client_configuration=configuration)
+        loader = await async_config.load_kube_config(context=context,
+                                                     client_configuration=configuration)
+        if "exec" in (loader._user or {}):
+            configuration.refresh_api_key_hook = _exec_token_refresher(loader)
     return async_client.ApiClient(configuration)
+
+
+def _exec_token_refresher(loader: Any) -> Callable[[Any], Awaitable[None]]:
+    """A hook that renews an exec-plugin token before it expires.
+
+    kubernetes_asyncio runs the exec plugin (gke-gcloud-auth-plugin, aws
+    eks get-token, ...) once at load time and installs no refresh hook, so a
+    job that outlives the token (an hour on GKE) gets 401 on every claim call.
+    The loader reruns the plugin only within five minutes of the expiry it
+    reported; the lock keeps concurrent requests from each running it.
+    """
+    lock = asyncio.Lock()
+
+    async def refresh(configuration: Any) -> None:
+        async with lock:
+            await loader.load_from_exec_plugin()
+        configuration.api_key["BearerToken"] = loader.token
+
+    return refresh
 
 
 async def get_clients(options: EnvironmentOptions) -> Clients:
