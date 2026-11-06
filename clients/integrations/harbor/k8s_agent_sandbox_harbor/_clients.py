@@ -56,6 +56,8 @@ class Clients:
     """The ``kubernetes_asyncio`` ``ApiClient`` behind the two clients above."""
     exec_slots: asyncio.Semaphore | None = None
     """One permit per executor thread; a transport takes one before it times a call."""
+    core_v1: Any = None
+    """``kubernetes_asyncio`` ``CoreV1Api`` from the same API client, to read the egress Service."""
 
 
 _clients: dict[tuple[str | None, str], Clients] = {}
@@ -137,6 +139,7 @@ async def get_clients(options: EnvironmentOptions) -> Clients:
             templates=TemplateStore(custom_objects, options.namespace, options, logger),
             api_client=api_client,
             exec_slots=asyncio.Semaphore(options.exec_threads),
+            core_v1=async_client.CoreV1Api(api_client),
         )
         _clients[key] = clients
         return clients

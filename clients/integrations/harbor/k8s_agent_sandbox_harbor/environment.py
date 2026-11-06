@@ -50,7 +50,8 @@ from .images import ImageResolver
 from .labels import (ANNOTATION_SESSION, LABEL_ENVIRONMENT, LABEL_TRIAL, label_value,
                      object_name)
 from .options import EnvironmentOptions
-from .templates import CONTAINER, ResourceSpec, common_labels, cpu_quantity
+from .templates import (CONTAINER, ResourceSpec, common_labels, cpu_quantity,
+                        resolve_egress_service)
 from .transport.archive import pack_dir, pack_file, unpack
 from .transport.podexec import PodExecTransport
 
@@ -246,11 +247,16 @@ class AgentSandboxEnvironment(BaseEnvironment):
         opts = self._options
         clients = await _clients.get_clients(opts)
         t0 = time.monotonic()
+        # Read the Service on every start, so a Service that was recreated with
+        # another cluster IP or selector gets a fresh template instead of a stale one.
+        service = (await resolve_egress_service(clients.core_v1, opts.egress_service)
+                   if opts.egress_service else None)
         self._pool = await clients.templates.ensure(
             image=self._image, resources=self._resources(),
             workdir=self.task_env_config.workdir or self._dockerfile_workdir,
             internet=self.network_policy.network_mode != NetworkMode.NO_NETWORK,
-            environment_name=self.environment_name, environment_id=self.environment_id)
+            environment_name=self.environment_name, environment_id=self.environment_id,
+            service=service)
         self._timings["template_s"] = time.monotonic() - t0
 
         t1 = time.monotonic()

@@ -26,7 +26,9 @@ from harbor.models.trial.config import ResourceMode
 
 from k8s_agent_sandbox_harbor import AgentSandboxEnvironment, ImageUnavailableError
 from k8s_agent_sandbox_harbor.labels import LABEL_ENVIRONMENT, LABEL_MANAGED_BY, LABEL_TRIAL
-from k8s_agent_sandbox_harbor.templates import POOLS, TEMPLATES
+from k8s_agent_sandbox_harbor.templates import POOLS, TEMPLATES, EgressServiceError
+
+from .fake_k8s import make_service
 
 SESSION = "hello-world__bZZeEkw__env"
 
@@ -191,6 +193,82 @@ async def test_a_task_without_internet_gets_a_template_that_blocks_all_traffic(
     closed = custom.objects[(TEMPLATES, closed_env._pool)]["spec"]["networkPolicy"]
     opened = custom.objects[(TEMPLATES, open_env._pool)]["spec"]["networkPolicy"]
     assert closed == {"ingress": [], "egress": []} and opened["egress"]
+
+
+EGRESS = {"egress_service": "proxy-ns/model-proxy:8080"}
+NO_INTERNET = NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+
+
+async def test_egress_service_reaches_the_template_of_a_task_without_internet(
+        task_dir, trial_paths, env_config, fake_clients):
+    fake_clients["core_v1"].add_service(make_service())
+    env = make_env(task_dir, trial_paths, env_config, network_policy=NO_INTERNET, **EGRESS)
+    await env.start(force_build=False)
+    spec = fake_clients["custom"].objects[(TEMPLATES, env._pool)]["spec"]
+    assert spec["networkPolicy"] == {"ingress": [], "egress": [{
+        "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "proxy-ns"}},
+                "podSelector": {"matchLabels": {"app": "model-proxy"}}}],
+        "ports": [{"protocol": "TCP", "port": 3000}]}]}
+    assert spec["podTemplate"]["spec"]["hostAliases"] == [{"ip": "10.96.0.20", "hostnames": [
+        "model-proxy.proxy-ns.svc", "model-proxy.proxy-ns.svc.cluster.local"]}]
+    assert fake_clients["core_v1"].reads == [("proxy-ns", "model-proxy")]
+
+
+async def test_egress_service_is_added_to_the_rules_of_a_task_with_internet(
+        task_dir, trial_paths, env_config, fake_clients):
+    fake_clients["core_v1"].add_service(make_service())
+    plain = make_env(task_dir, trial_paths, env_config)
+    env = make_env(task_dir, trial_paths, env_config, **EGRESS)
+    await plain.start(force_build=False)
+    await env.start(force_build=False)
+    objects = fake_clients["custom"].objects
+    base = objects[(TEMPLATES, plain._pool)]["spec"]["networkPolicy"]["egress"]
+    egress = objects[(TEMPLATES, env._pool)]["spec"]["networkPolicy"]["egress"]
+    assert env._pool != plain._pool and egress[:-1] == base and len(egress) == len(base) + 1
+
+
+async def test_a_recreated_service_gets_a_new_template(task_dir, trial_paths, env_config,
+                                                       fake_clients):
+    core = fake_clients["core_v1"]
+    core.add_service(make_service(cluster_ip="10.96.0.20"))
+    first = make_env(task_dir, trial_paths, env_config, **EGRESS)
+    await first.start(force_build=False)
+    core.add_service(make_service(cluster_ip="10.96.0.99"))
+    second = make_env(task_dir, trial_paths, env_config, **EGRESS)
+    await second.start(force_build=False)
+    assert first._pool != second._pool
+    hosts = fake_clients["custom"].objects[(TEMPLATES, second._pool)]["spec"]["podTemplate"]["spec"]
+    assert hosts["hostAliases"][0]["ip"] == "10.96.0.99"
+
+
+@pytest.mark.parametrize("service, forbidden, message", [
+    (make_service(cluster_ip="None"), False, "headless"),
+    (make_service(selector={}), False, "no selector"),
+    (make_service(ports=((9090, 9090, "TCP"),)), False, "no port 8080"),
+    (None, False, "does not exist"),
+    (make_service(), True, "'get' on 'services'"),
+])
+async def test_an_unusable_egress_service_fails_start_before_any_claim(
+        task_dir, trial_paths, env_config, fake_clients, service, forbidden, message):
+    core = fake_clients["core_v1"]
+    if service is not None:
+        core.add_service(service)
+    if forbidden:
+        core.forbidden.add(("proxy-ns", "model-proxy"))
+    env = make_env(task_dir, trial_paths, env_config, **EGRESS)
+    with pytest.raises(EgressServiceError, match=f"proxy-ns/model-proxy.*{message}"):
+        await env.start(force_build=False)
+    assert fake_clients["sandbox_client"].created == [] and fake_clients["custom"].objects == {}
+
+
+async def test_without_egress_service_no_service_is_read_or_rendered(
+        task_dir, trial_paths, env_config, fake_clients):
+    env = make_env(task_dir, trial_paths, env_config, network_policy=NO_INTERNET)
+    await env.start(force_build=False)
+    spec = fake_clients["custom"].objects[(TEMPLATES, env._pool)]["spec"]
+    assert spec["networkPolicy"] == {"ingress": [], "egress": []}
+    assert "hostAliases" not in spec["podTemplate"]["spec"]
+    assert fake_clients["core_v1"].reads == []
 
 
 async def test_write_timings_lands_in_the_sandbox(task_dir, trial_paths, env_config, fake_clients):

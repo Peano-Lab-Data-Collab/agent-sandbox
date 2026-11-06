@@ -23,14 +23,51 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (BaseModel, ConfigDict, Field, ValidationError, field_validator,
+                      model_validator)
 
 ENV_PREFIX = "K8S_SANDBOX_HARBOR_"
 # Harbor passes its own constructor arguments as keywords too; anything that is
 # neither one of those nor one of our options is a misspelled --ek key.
 _HARBOR_LEGACY_KWARGS = frozenset({"suppress_override_warnings"})
+
+
+_DNS_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
+_EGRESS_SERVICE_FORMAT = "<namespace>/<service>:<port>"
+
+
+@dataclass(frozen=True)
+class EgressService:
+    """The in-cluster Service every trial pod may reach, as the operator named it."""
+
+    namespace: str
+    name: str
+    port: int
+
+    @classmethod
+    def parse(cls, text: str) -> "EgressService":
+        """Parse ``<namespace>/<service>:<port>``, rejecting anything else."""
+        namespace, slash, rest = text.strip().partition("/")
+        name, colon, port_text = rest.partition(":")
+        problem = None
+        if not (slash and colon):
+            problem = "missing a '/' or ':'"
+        elif not all(_valid_dns_label(part) for part in (namespace, name)):
+            problem = "namespace and service must be DNS labels (lowercase letters, digits, '-')"
+        elif not (port_text.isascii() and port_text.isdigit() and 1 <= int(port_text) <= 65535):
+            problem = "port must be a number from 1 to 65535"
+        if problem:
+            raise ValueError(f"egress_service {text!r} must look like "
+                             f"{_EGRESS_SERVICE_FORMAT}: {problem}")
+        return cls(namespace=namespace, name=name, port=int(port_text))
+
+
+def _valid_dns_label(text: str) -> bool:
+    return len(text) <= 63 and _DNS_LABEL.fullmatch(text) is not None
 
 
 def _harbor_constructor_params() -> frozenset[str]:
@@ -107,11 +144,29 @@ class EnvironmentOptions(BaseModel):
     """``k=v,...`` labels added to every object this package creates."""
     run_as_root: bool = True
     """Run the pod as uid 0, which Harbor's agent setup and ``su`` need."""
+    egress_service: EgressService | None = None
+    """``<namespace>/<service>:<port>`` of an in-cluster Service every trial pod may reach, even
+    when the task has no internet. Needs ``network=dns-public``."""
 
     @field_validator("node_selector", "extra_labels", mode="before")
     @classmethod
     def _mapping(cls, v: Any) -> dict[str, str]:
         return _parse_mapping(v)
+
+    @field_validator("egress_service", mode="before")
+    @classmethod
+    def _egress_service(cls, v: Any) -> EgressService | None:
+        if v is None or v == "":
+            return None
+        return v if isinstance(v, EgressService) else EgressService.parse(str(v))
+
+    @model_validator(mode="after")
+    def _egress_service_needs_an_editable_policy(self) -> "EnvironmentOptions":
+        if self.egress_service is not None and self.network == "managed-default":
+            raise ValueError("egress_service cannot be combined with network=managed-default: "
+                             "the controller's default policy cannot be extended, so use "
+                             "network=dns-public")
+        return self
 
     @field_validator("tolerations", mode="before")
     @classmethod

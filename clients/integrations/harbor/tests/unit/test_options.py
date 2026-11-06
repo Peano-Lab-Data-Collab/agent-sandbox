@@ -16,7 +16,7 @@
 
 import pytest
 
-from k8s_agent_sandbox_harbor.options import EnvironmentOptions
+from k8s_agent_sandbox_harbor.options import EgressService, EnvironmentOptions
 
 
 def test_defaults_and_string_coercion():
@@ -47,3 +47,27 @@ def test_env_vars_are_defaults_and_kwargs_win(monkeypatch):
     monkeypatch.setenv("K8S_SANDBOX_HARBOR_RUNTIME_CLASS", "gvisor")
     opts = EnvironmentOptions.from_kwargs({"namespace": "from-ek"})
     assert opts.namespace == "from-ek" and opts.runtime_class == "gvisor"
+
+
+def test_egress_service_parses_namespace_service_and_port(monkeypatch):
+    opts = EnvironmentOptions.from_kwargs({"egress_service": "proxy-ns/model-proxy:8080"})
+    assert opts.egress_service == EgressService("proxy-ns", "model-proxy", 8080)
+    assert EnvironmentOptions.from_kwargs({}).egress_service is None
+    monkeypatch.setenv("K8S_SANDBOX_HARBOR_EGRESS_SERVICE", "other/svc:1")
+    assert EnvironmentOptions.from_kwargs({}).egress_service == EgressService("other", "svc", 1)
+
+
+@pytest.mark.parametrize("bad", [
+    "model-proxy:8080", "ns/model-proxy", "ns/model-proxy:http", "ns/model-proxy:0",
+    "ns/model-proxy:65536", "ns/model-proxy:-1", "NS/model-proxy:80", "ns/model_proxy:80",
+    "ns/-proxy:80", "/svc:80", "ns/:80", "a/b/c:80", f"ns/{'a' * 64}:80"])
+def test_egress_service_rejects_a_malformed_value(bad):
+    with pytest.raises(ValueError, match=r"egress_service .*<namespace>/<service>:<port>"):
+        EnvironmentOptions.from_kwargs({"egress_service": bad})
+
+
+def test_egress_service_cannot_extend_the_controllers_default_policy():
+    with pytest.raises(ValueError, match="egress_service.*network=managed-default"):
+        EnvironmentOptions.from_kwargs({"egress_service": "ns/svc:80", "network": "managed-default"})
+    # The default network and an explicit dns-public both accept it.
+    assert EnvironmentOptions.from_kwargs({"egress_service": "ns/svc:80", "network": "dns-public"})

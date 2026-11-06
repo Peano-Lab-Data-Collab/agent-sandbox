@@ -17,12 +17,13 @@
 import pytest
 
 from k8s_agent_sandbox_harbor.labels import LABEL_MANAGED_BY, MANAGED_BY_VALUE
-from k8s_agent_sandbox_harbor.options import EnvironmentOptions
-from k8s_agent_sandbox_harbor.templates import (CLAIMS, POOLS, TEMPLATES, ResourceSpec,
-                                                TemplateStore, cpu_quantity, render_pool,
-                                                render_template, template_name_for)
+from k8s_agent_sandbox_harbor.options import EgressService, EnvironmentOptions
+from k8s_agent_sandbox_harbor.templates import (CLAIMS, POOLS, TEMPLATES, EgressServiceError,
+                                                ResolvedService, ResourceSpec, TemplateStore,
+                                                cpu_quantity, render_pool, render_template,
+                                                resolve_egress_service, template_name_for)
 
-from .fake_k8s import FakeCustomObjects
+from .fake_k8s import FakeCoreV1, FakeCustomObjects, make_service
 
 RES = ResourceSpec(cpu_request="1", cpu_limit="1", memory_request="2048Mi", memory_limit="2048Mi",
                    storage_request="10240Mi")
@@ -138,3 +139,94 @@ async def test_store_raises_on_other_api_errors():
     with pytest.raises(Exception, match="403"):
         await TemplateStore(Broken(), "ns", EnvironmentOptions()).ensure(
             image="img", resources=RES, workdir=None, internet=True, environment_name="t", environment_id="e")
+
+
+WANTED = EgressService("proxy-ns", "model-proxy", 8080)
+PROXY = ResolvedService(namespace="proxy-ns", name="model-proxy", cluster_ip="10.96.0.20",
+                        selector=(("app", "model-proxy"),), target_port=3000, protocol="TCP")
+PROXY_RULE = {"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "proxy-ns"}},
+                      "podSelector": {"matchLabels": {"app": "model-proxy"}}}],
+              "ports": [{"protocol": "TCP", "port": 3000}]}
+
+
+def _render(*, internet, service, network="dns-public"):
+    return render_template(name="n", namespace="ns", image="i", resources=RES,
+                           options=EnvironmentOptions(network=network), workdir=None,
+                           internet=internet, environment_name="x", environment_id="e",
+                           service=service)
+
+
+def test_a_task_with_internet_keeps_dns_and_public_egress_and_gains_the_service_rule():
+    t = _render(internet=True, service=PROXY)
+    egress = t["spec"]["networkPolicy"]["egress"]
+    assert egress[:-1] == _render(internet=True, service=None)["spec"]["networkPolicy"]["egress"]
+    assert egress[-1] == PROXY_RULE
+    assert t["spec"]["networkPolicy"]["ingress"] == []
+
+
+def test_a_task_without_internet_reaches_the_service_and_nothing_else():
+    t = _render(internet=False, service=PROXY)
+    assert t["spec"]["networkPolicy"] == {"ingress": [], "egress": [PROXY_RULE]}
+
+
+def test_the_pod_resolves_the_service_name_without_dns():
+    pod = _render(internet=False, service=PROXY)["spec"]["podTemplate"]["spec"]
+    assert pod["hostAliases"] == [{"ip": "10.96.0.20", "hostnames": [
+        "model-proxy.proxy-ns.svc", "model-proxy.proxy-ns.svc.cluster.local"]}]
+    assert "hostAliases" not in _render(internet=False, service=None)["spec"]["podTemplate"]["spec"]
+
+
+def test_the_protocol_is_passed_through():
+    udp = ResolvedService("proxy-ns", "model-proxy", "10.96.0.20", (("app", "p"),), 5353, "UDP")
+    rule = _render(internet=False, service=udp)["spec"]["networkPolicy"]["egress"][0]
+    assert rule["ports"] == [{"protocol": "UDP", "port": 5353}]
+
+
+def test_template_name_changes_with_every_resolved_field():
+    from dataclasses import replace
+    opts = EnvironmentOptions()
+
+    def name(service):
+        return template_name_for(opts, "img:1", RES, "/app", internet=False, service=service)
+
+    names = {name(None), name(PROXY),
+             name(replace(PROXY, cluster_ip="10.96.0.21")),
+             name(replace(PROXY, selector=(("app", "other"),))),
+             name(replace(PROXY, target_port=3001)),
+             name(replace(PROXY, protocol="UDP")),
+             name(replace(PROXY, namespace="elsewhere")),
+             name(replace(PROXY, name="other-proxy"))}
+    assert len(names) == 8
+    assert name(replace(PROXY)) == name(PROXY)
+
+
+async def test_resolve_reads_the_service_the_rule_needs():
+    api = FakeCoreV1()
+    api.add_service(make_service(ports=((80, 8000, "TCP"), (8080, "9090", "UDP"))))
+    assert await resolve_egress_service(api, WANTED) == ResolvedService(
+        namespace="proxy-ns", name="model-proxy", cluster_ip="10.96.0.20",
+        selector=(("app", "model-proxy"),), target_port=9090, protocol="UDP")
+
+
+@pytest.mark.parametrize("service, message", [
+    (make_service(selector={}), "no selector"),
+    (make_service(cluster_ip="None"), "headless"),
+    (make_service(cluster_ip=""), "headless"),
+    (make_service(ports=((9090, 9090, "TCP"),)), r"no port 8080 \(ports: 9090\)"),
+    (make_service(ports=((8080, "http", "TCP"),)), "named targetPort 'http'.*port number"),
+])
+async def test_resolve_refuses_a_service_a_network_policy_cannot_admit(service, message):
+    api = FakeCoreV1()
+    api.add_service(service)
+    with pytest.raises(EgressServiceError, match=f"proxy-ns/model-proxy.*{message}"):
+        await resolve_egress_service(api, WANTED)
+
+
+async def test_resolve_names_the_missing_permission_on_403_and_the_service_on_404():
+    api = FakeCoreV1()
+    with pytest.raises(EgressServiceError, match="proxy-ns/model-proxy does not exist"):
+        await resolve_egress_service(api, WANTED)
+    api.forbidden.add(("proxy-ns", "model-proxy"))
+    with pytest.raises(EgressServiceError,
+                       match="proxy-ns/model-proxy.*'get' on 'services' in namespace proxy-ns"):
+        await resolve_egress_service(api, WANTED)

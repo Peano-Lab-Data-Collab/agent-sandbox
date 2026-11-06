@@ -21,6 +21,7 @@ import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from harbor.environments.base import ExecResult
@@ -61,6 +62,37 @@ class FakeCustomObjects:
         if (plural, name) not in self.objects:
             raise ApiError(404, "NotFound")
         del self.objects[(plural, name)]
+
+
+def make_service(*, namespace="proxy-ns", name="model-proxy", cluster_ip="10.96.0.20",
+                 selector=None, ports=((8080, 3000, "TCP"),)):
+    """A ``V1Service`` look-alike with the attributes ``kubernetes_asyncio`` models expose."""
+    return SimpleNamespace(
+        metadata=SimpleNamespace(namespace=namespace, name=name),
+        spec=SimpleNamespace(
+            cluster_ip=cluster_ip,
+            selector={"app": "model-proxy"} if selector is None else selector,
+            ports=[SimpleNamespace(port=p, target_port=t, protocol=proto) for p, t, proto in ports]))
+
+
+class FakeCoreV1:
+    """Enough of ``CoreV1Api`` to read a Service: 404 when absent, 403 when forbidden."""
+
+    def __init__(self) -> None:
+        self.services: dict[tuple[str, str], Any] = {}
+        self.forbidden: set[tuple[str, str]] = set()
+        self.reads: list[tuple[str, str]] = []
+
+    def add_service(self, service) -> None:
+        self.services[(service.metadata.namespace, service.metadata.name)] = service
+
+    async def read_namespaced_service(self, name, namespace, **_):
+        self.reads.append((namespace, name))
+        if (namespace, name) in self.forbidden:
+            raise ApiError(403, "Forbidden")
+        if (namespace, name) not in self.services:
+            raise ApiError(404, "NotFound")
+        return self.services[(namespace, name)]
 
 
 class FakeSandbox:

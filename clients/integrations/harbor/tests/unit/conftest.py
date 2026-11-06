@@ -27,7 +27,7 @@ from k8s_agent_sandbox_harbor import _clients
 from k8s_agent_sandbox_harbor.options import EnvironmentOptions
 from k8s_agent_sandbox_harbor.templates import TemplateStore
 
-from .fake_k8s import FakeCustomObjects, FakeSandboxClient, LocalTransport
+from .fake_k8s import FakeCoreV1, FakeCustomObjects, FakeSandboxClient, LocalTransport
 
 
 @pytest.fixture
@@ -54,10 +54,11 @@ def env_config() -> EnvironmentConfig:
 def fake_clients(monkeypatch: pytest.MonkeyPatch):
     """Patch the shared clients with fakes and return them."""
     custom = FakeCustomObjects()
+    core_v1 = FakeCoreV1()
     sandbox_client = FakeSandboxClient()
     transport = LocalTransport()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-    state = {"custom": custom, "sandbox_client": sandbox_client, "transport": transport}
+    state = {"custom": custom, "core_v1": core_v1, "sandbox_client": sandbox_client, "transport": transport}
     stores: dict[str, TemplateStore] = {}
 
     async def fake_get_clients(options: EnvironmentOptions):
@@ -68,7 +69,7 @@ def fake_clients(monkeypatch: pytest.MonkeyPatch):
         return _clients.Clients(
             sandbox_client=sandbox_client, custom_objects=custom,
             core_v1_factory=lambda: None,  # type: ignore[arg-type,return-value]
-            executor=executor, templates=store)
+            executor=executor, templates=store, core_v1=core_v1)
 
     monkeypatch.setattr(_clients, "get_clients", fake_get_clients)
 

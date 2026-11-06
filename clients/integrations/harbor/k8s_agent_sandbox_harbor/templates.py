@@ -32,7 +32,7 @@ from typing import Any
 from .labels import (ANNOTATION_ENVIRONMENT_ID, ANNOTATION_IMAGE, LABEL_ENVIRONMENT,
                      LABEL_IMAGE_HASH, LABEL_MANAGED_BY, MANAGED_BY_VALUE, label_value,
                      object_name, short_hash)
-from .options import EnvironmentOptions
+from .options import EgressService, EnvironmentOptions
 
 GROUP = "extensions.agents.x-k8s.io"
 VERSION = "v1beta1"
@@ -71,6 +71,88 @@ class ResourceSpec:
         return out
 
 
+@dataclass(frozen=True)
+class ResolvedService:
+    """What the cluster says about the operator's ``egress_service``.
+
+    A NetworkPolicy matches the backend pods and their target port, after the
+    Service has translated the address, so the rule is built from ``selector``
+    and ``target_port``. ``cluster_ip`` only feeds the pod's ``hostAliases``.
+    """
+
+    namespace: str
+    name: str
+    cluster_ip: str
+    selector: tuple[tuple[str, str], ...]
+    """The Service's pod selector as sorted pairs, so the dataclass stays hashable."""
+    target_port: int
+    protocol: str
+
+    @property
+    def hostnames(self) -> list[str]:
+        return [f"{self.name}.{self.namespace}.svc", f"{self.name}.{self.namespace}.svc.cluster.local"]
+
+
+class EgressServiceError(RuntimeError):
+    """The Service named by ``egress_service`` cannot be reached through a NetworkPolicy."""
+
+
+async def resolve_egress_service(core_api: Any, wanted: EgressService) -> ResolvedService:
+    """Read the Service and check that a NetworkPolicy can admit its backends.
+
+    ``core_api`` is a ``kubernetes_asyncio`` ``CoreV1Api``. Every refusal names
+    the Service, so the operator sees which ``egress_service`` to fix before
+    any claim exists.
+    """
+    ref = f"Service {wanted.namespace}/{wanted.name}"
+    try:
+        service = await core_api.read_namespaced_service(wanted.name, wanted.namespace)
+    except Exception as exc:  # noqa: BLE001 - only 404 and 403 are translated
+        status = getattr(exc, "status", None)
+        if status == 404:
+            raise EgressServiceError(f"egress_service: {ref} does not exist") from exc
+        if status == 403:
+            raise EgressServiceError(
+                f"egress_service: not allowed to read {ref}; grant 'get' on 'services' in "
+                f"namespace {wanted.namespace}") from exc
+        raise
+    spec = service.spec
+    if not spec.selector:
+        raise EgressServiceError(
+            f"egress_service: {ref} has no selector, so there are no pods a NetworkPolicy "
+            f"can match")
+    if spec.cluster_ip in (None, "", "None"):
+        raise EgressServiceError(
+            f"egress_service: {ref} is headless (no cluster IP), so its name cannot be "
+            f"pinned in the pod's hosts file")
+    port = next((p for p in spec.ports or [] if p.port == wanted.port), None)
+    if port is None:
+        offered = ", ".join(str(p.port) for p in spec.ports or []) or "none"
+        raise EgressServiceError(f"egress_service: {ref} has no port {wanted.port} "
+                                 f"(ports: {offered})")
+    target = port.target_port if port.target_port is not None else port.port
+    if isinstance(target, str) and not target.isdecimal():
+        # GKE Dataplane V2 silently drops egress to a named port in another
+        # namespace, so the rule must carry the number.
+        raise EgressServiceError(
+            f"egress_service: {ref} port {wanted.port} has the named targetPort {target!r}; "
+            f"set targetPort to the container's port number")
+    return ResolvedService(
+        namespace=wanted.namespace, name=wanted.name, cluster_ip=spec.cluster_ip,
+        selector=tuple(sorted(spec.selector.items())), target_port=int(target),
+        protocol=port.protocol or "TCP")
+
+
+def egress_service_rule(service: ResolvedService) -> dict[str, Any]:
+    """Egress to the Service's backend pods on its target port."""
+    return {
+        "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name":
+                                                      service.namespace}},
+                "podSelector": {"matchLabels": dict(service.selector)}}],
+        "ports": [{"protocol": service.protocol, "port": service.target_port}],
+    }
+
+
 def cpu_quantity(cpus: int | float) -> str:
     """Whole cores as ``"2"``, fractions as millicores ``"500m"``."""
     if float(cpus).is_integer():
@@ -103,26 +185,33 @@ def dns_public_egress() -> list[dict[str, Any]]:
     ]
 
 
-def template_network_policy(options: EnvironmentOptions, internet: bool) -> dict[str, Any] | None:
+def template_network_policy(options: EnvironmentOptions, internet: bool,
+                            service: ResolvedService | None = None) -> dict[str, Any] | None:
     """The template's ``networkPolicy``; ``None`` keeps the controller default.
 
     The controller blocks all traffic in a direction whose rule list is empty,
     so a task without internet gets no egress at all, not even cluster DNS.
     No rule allows ingress, because the pod exec API reaches the pod through
-    the kubelet.
+    the kubelet. The operator's ``service``, when set, is the one exception
+    to the task's network mode and is added to either rule list. The options
+    refuse it together with the controller default, which cannot be extended.
     """
     if not internet:
-        return {"ingress": [], "egress": []}
-    if options.network == "dns-public":
+        egress: list[dict[str, Any]] = []
+    elif options.network == "dns-public":
         # The controller's default policy blocks every private range, cluster
         # DNS included, so a task could not resolve a hostname. Harbor tasks
         # install packages and fetch test tooling, thus DNS and public egress.
-        return {"ingress": [], "egress": dns_public_egress()}
-    return None
+        egress = dns_public_egress()
+    else:
+        return None
+    if service is not None:
+        egress.append(egress_service_rule(service))
+    return {"ingress": [], "egress": egress}
 
 
 def render_pod_spec(image: str, resources: ResourceSpec, options: EnvironmentOptions,
-                    workdir: str | None) -> dict[str, Any]:
+                    workdir: str | None, service: ResolvedService | None = None) -> dict[str, Any]:
     container: dict[str, Any] = {
         "name": CONTAINER,
         "image": image,
@@ -151,6 +240,9 @@ def render_pod_spec(image: str, resources: ResourceSpec, options: EnvironmentOpt
         spec["tolerations"] = [dict(t) for t in options.tolerations]
     if options.image_pull_secret:
         spec["imagePullSecrets"] = [{"name": options.image_pull_secret}]
+    if service is not None:
+        # The pod may not query DNS, so the Service's names resolve from its hosts file.
+        spec["hostAliases"] = [{"ip": service.cluster_ip, "hostnames": service.hostnames}]
     return spec
 
 
@@ -160,14 +252,15 @@ def common_labels(options: EnvironmentOptions) -> dict[str, str]:
 
 def render_template(*, name: str, namespace: str, image: str, resources: ResourceSpec,
                     options: EnvironmentOptions, workdir: str | None, internet: bool,
-                    environment_name: str, environment_id: str) -> dict[str, Any]:
+                    environment_name: str, environment_id: str,
+                    service: ResolvedService | None = None) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "podTemplate": {
             "metadata": {"labels": common_labels(options)},
-            "spec": render_pod_spec(image, resources, options, workdir),
+            "spec": render_pod_spec(image, resources, options, workdir, service),
         },
     }
-    network_policy = template_network_policy(options, internet)
+    network_policy = template_network_policy(options, internet, service)
     if network_policy is not None:
         spec["networkPolicy"] = network_policy
     labels = {
@@ -197,13 +290,14 @@ def render_pool(*, name: str, namespace: str, template_name: str, replicas: int,
 
 
 def template_name_for(options: EnvironmentOptions, image: str, resources: ResourceSpec,
-                      workdir: str | None, *, internet: bool) -> str:
+                      workdir: str | None, *, internet: bool,
+                      service: ResolvedService | None = None) -> str:
     """Name from everything that shapes the pair, so equal inputs share one
     template and pool, and a changed input (a new image, other resources, a
-    different replica count, labels or network policy) gets a new pair instead
-    of a silent reuse."""
-    pod = render_pod_spec(image, resources, options, workdir)
-    network = template_network_policy(options, internet)
+    different replica count, labels, network policy or egress Service) gets a
+    new pair instead of a silent reuse."""
+    pod = render_pod_spec(image, resources, options, workdir, service)
+    network = template_network_policy(options, internet, service)
     key = json.dumps({"pod": pod, "network": network,
                       "replicas": options.warm_replicas, "labels": common_labels(options)},
                      sort_keys=True)
@@ -248,9 +342,11 @@ class TemplateStore:
             raise
 
     async def ensure(self, *, image: str, resources: ResourceSpec, workdir: str | None,
-                     internet: bool, environment_name: str, environment_id: str) -> str:
+                     internet: bool, environment_name: str, environment_id: str,
+                     service: ResolvedService | None = None) -> str:
         """Return the pool name for ``image``, creating template and pool if needed."""
-        name = template_name_for(self._options, image, resources, workdir, internet=internet)
+        name = template_name_for(self._options, image, resources, workdir, internet=internet,
+                                 service=service)
         if name in self._ready:
             return name
         async with self._lock(name):
@@ -260,7 +356,7 @@ class TemplateStore:
                 name=name, namespace=self._namespace, image=image, resources=resources,
                 options=self._options, workdir=workdir, internet=internet,
                 environment_name=environment_name,
-                environment_id=environment_id)
+                environment_id=environment_id, service=service)
             created = await self._create(TEMPLATES, template)
             pool = render_pool(name=name, namespace=self._namespace, template_name=name,
                                replicas=self._options.warm_replicas,
